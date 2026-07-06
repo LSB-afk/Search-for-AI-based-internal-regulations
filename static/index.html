@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>내부규정 RAG Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="kicker">On-premise regulation retrieval</p>
+          <h1>내부규정 RAG Console</h1>
+        </div>
+        <div class="status-strip">
+          <span id="health-dot" class="dot"></span>
+          <span id="health-text">연결 확인 중</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="control-panel" aria-label="검색 조건">
+          <section class="panel-section">
+            <label class="field-label" for="role-control">사용자 권한</label>
+            <div id="role-control" class="segmented" role="radiogroup" aria-label="사용자 권한">
+              <button class="segment active" data-role="employee" type="button">일반직원</button>
+              <button class="segment" data-role="audit" type="button">감사실</button>
+              <button class="segment" data-role="admin" type="button">관리자</button>
+            </div>
+          </section>
+
+          <section class="panel-section">
+            <label class="field-label" for="as-of">시행 기준일</label>
+            <input id="as-of" class="date-input" type="date" value="2026-05-27" />
+          </section>
+
+          <section class="panel-section">
+            <label class="field-label" for="file-input">문서 추가</label>
+            <input id="file-input" class="file-input" type="file" accept=".pdf,.hwpx,.hwp,.zip" />
+            <button id="upload-button" class="secondary-button" type="button">업로드 색인</button>
+            <button id="local-ingest-button" class="secondary-button" type="button">현재 폴더 색인</button>
+            <button id="reset-button" class="ghost-button" type="button">샘플로 초기화</button>
+          </section>
+
+          <section class="panel-section compact">
+            <div class="metric-line">
+              <span>문서</span>
+              <strong id="doc-count">0</strong>
+            </div>
+            <div class="metric-line">
+              <span>청크</span>
+              <strong id="chunk-count">0</strong>
+            </div>
+          </section>
+        </aside>
+
+        <section class="search-panel" aria-label="질의 응답">
+          <form id="search-form" class="query-form">
+            <label class="field-label" for="query-input">질문</label>
+            <textarea id="query-input" rows="4">2026년 기준 징계양정은 어떤 규정을 봐야 하나?</textarea>
+            <div class="query-actions">
+              <div class="quick-queries" aria-label="질문 예시">
+                <button type="button" data-query="감사자료 제출 권한은 누가 가지나?">감사자료</button>
+                <button type="button" data-query="2024년 기준 재난 상황에서는 어떤 지침이 우선인가?">재난 우선</button>
+                <button type="button" data-query="대외비 문서 열람은 어떤 조건이 필요한가?">대외비</button>
+              </div>
+              <button class="primary-button" type="submit">검색</button>
+            </div>
+          </form>
+
+          <section class="answer-zone" aria-live="polite">
+            <div class="answer-header">
+              <h2>답변</h2>
+              <div id="filter-summary" class="filter-summary"></div>
+            </div>
+            <pre id="answer-output" class="answer-output">질문을 입력하고 검색하세요.</pre>
+          </section>
+
+          <section>
+            <div class="section-title">
+              <h2>근거 조항</h2>
+              <span id="result-count">0건</span>
+            </div>
+            <div id="results" class="results-list"></div>
+          </section>
+        </section>
+
+        <aside class="documents-panel" aria-label="색인 문서">
+          <div class="section-title">
+            <h2>색인 문서</h2>
+          </div>
+          <div id="documents" class="document-list"></div>
+        </aside>
+      </main>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

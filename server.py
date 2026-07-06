@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import calendar
+import html
+import json
+import math
+import mimetypes
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import unicodedata
+import uuid
+import zipfile
+from collections import Counter, defaultdict
+from datetime import date
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+try:
+    import pdfplumber  # type: ignore
+except Exception:  # pragma: no cover - handled at runtime
+    pdfplumber = None
+
+
+ROOT = Path(__file__).resolve().parent
+STATIC_DIR = ROOT / "static"
+DATA_DIR = ROOT / "data"
+UPLOADS_DIR = ROOT / "uploads"
+INDEX_FILE = DATA_DIR / "index.json"
+WORKSPACE_DIR = ROOT.parent
+HWP5TXT = Path(os.environ.get("HWP5TXT_BIN") or shutil.which("hwp5txt") or "/opt/anaconda3/bin/hwp5txt")
+BUNDLED_PYTHON = Path(
+    os.environ.get("REG_RAG_PDF_PYTHON")
+    or "/Users/leeseungbo/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+)
+
+ROLE_LEVEL = {"employee": 1, "audit": 2, "admin": 3}
+PERMISSION_LEVEL = {"public": 0, "internal": 1, "audit": 2, "admin": 3}
+
+ROLE_LABEL = {"employee": "일반직원", "audit": "감사실", "admin": "관리자"}
+PERMISSION_LABEL = {"public": "공개", "internal": "내부", "audit": "감사", "admin": "관리자"}
+
+STOPWORDS = {
+    "그리고",
+    "그러나",
+    "대한",
+    "관련",
+    "기준",
+    "경우",
+    "무엇",
+    "어떻게",
+    "어떤",
+    "있는",
+    "없는",
+    "한다",
+    "된다",
+    "합니다",
+    "주세요",
+    "알려줘",
+    "대해",
+    "으로",
+    "에서",
+    "에게",
+    "까지",
+    "부터",
+    "으로써",
+}
+
+SENSITIVE_QUERY_TERMS = {"대외비", "비밀", "개인정보"}
+SENSITIVE_MATCH_TERMS = {"대외비", "비밀", "개인정보", "보안", "비공개"}
+
+SYNONYMS = {
+    "징계": ["징계", "문책", "양정", "인사", "복무", "감사"],
+    "감사": ["감사", "조사", "점검", "내부통제", "대외비", "자료제출"],
+    "권한": ["권한", "열람", "보안", "접근", "등급", "허가"],
+    "보안": ["보안", "대외비", "비공개", "접근", "권한", "열람"],
+    "시행": ["시행", "개정", "부칙", "효력", "적용", "시점"],
+    "개정": ["개정", "시행", "부칙", "효력", "적용", "시점"],
+    "계약": ["계약", "회계", "지출", "예산", "입찰"],
+    "심의": ["심의", "위원회", "검토", "의결"],
+    "휴가": ["휴가", "복무", "근무", "근태"],
+    "재난": ["재난", "안전", "대책본부", "비상", "위기"],
+    "안전": ["안전", "재난", "대책본부", "비상", "위기"],
+    "표": ["표", "별표", "기준표", "양정", "서식"],
+}
+
+
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: Path, value: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def tokenize(text: str) -> list[str]:
+    raw = re.findall(r"[가-힣A-Za-z0-9]{2,}", text.lower())
+    tokens: list[str] = []
+    for token in raw:
+        if token in STOPWORDS:
+            continue
+        if re.search(r"[가-힣]", token) and len(token) > 2:
+            token = re.sub(r"(으로써|으로|에게|에서|부터|까지|에는|에게는|은|는|이|가|을|를|의|와|과|도|만|로)$", "", token)
+        if len(token) >= 2 and token not in STOPWORDS:
+            tokens.append(token)
+    return tokens
+
+
+def expand_terms(terms: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for term in terms:
+        expanded.append(term)
+        for key, values in SYNONYMS.items():
+            if term == key or key in term or term in key:
+                expanded.extend(values)
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in expanded:
+        if term not in seen:
+            seen.add(term)
+            result.append(term)
+    return result
+
+
+def parse_date_value(value: str | None) -> date | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d"):
+        try:
+            parts = value.replace("/", "-").replace(".", "-").split("-")
+            if len(parts) == 3:
+                return date(int(parts[0]), int(parts[1]), int(parts[2]))
+        except Exception:
+            pass
+    return None
+
+
+def detect_date(query: str, explicit: str | None) -> str | None:
+    patterns = [
+        r"(20\d{2})\s*[년./-]\s*(\d{1,2})\s*[월./-]\s*(\d{1,2})",
+        r"(20\d{2})\s*[년./-]\s*(\d{1,2})",
+        r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})",
+        r"(20\d{2})[-./](\d{1,2})",
+        r"(20\d{2})\s*년",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query)
+        if not match:
+            continue
+        year = int(match.group(1))
+        month = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2) else 12
+        day = (
+            int(match.group(3))
+            if len(match.groups()) >= 3 and match.group(3)
+            else calendar.monthrange(year, month)[1]
+        )
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+    parsed = parse_date_value(explicit)
+    if parsed:
+        return parsed.isoformat()
+    return None
+
+
+def date_from_text(text: str) -> str | None:
+    match = re.search(r"(20\d{2})[.\-년]\s*(\d{1,2})[.\-월]\s*(\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+    except ValueError:
+        return None
+
+
+def chunk_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def make_chunk(
+    *,
+    doc_title: str,
+    section_title: str,
+    text: str,
+    permission: str = "internal",
+    effective_from: str | None = None,
+    effective_to: str | None = None,
+    page: int | None = None,
+    source_file: str = "sample",
+    source_type: str = "sample",
+    source_path: str | None = None,
+) -> dict[str, Any]:
+    clean_text = normalize_space(text)
+    return {
+        "id": chunk_id(),
+        "doc_title": doc_title,
+        "section_title": section_title,
+        "text": clean_text,
+        "permission": permission,
+        "effective_from": effective_from,
+        "effective_to": effective_to,
+        "page": page,
+        "source_file": source_file,
+        "source_type": source_type,
+        "source_path": source_path,
+        "tokens": tokenize(f"{doc_title} {section_title} {clean_text}"),
+        "created_at": now_ms(),
+    }
+
+
+def sample_chunks() -> list[dict[str, Any]]:
+    return [
+        make_chunk(
+            doc_title="정관",
+            section_title="제1장 총칙",
+            permission="public",
+            effective_from="2023-07-31",
+            text=(
+                "공사는 지방공기업법과 설립 조례에 따라 공공성과 효율성을 함께 추구한다. "
+                "정관은 조직, 임원, 이사회, 사업 범위, 회계의 최상위 기준으로 적용된다. "
+                "하위 규정이 정관과 충돌하는 경우 정관을 우선한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="인사규정",
+            section_title="제28조 복무와 근태",
+            permission="internal",
+            effective_from="2023-07-31",
+            text=(
+                "직원은 근무시간, 휴가, 출장, 교육훈련 등 복무 기준을 준수해야 한다. "
+                "복무 위반 사항은 사안의 경중과 반복 여부를 고려하여 인사위원회 심의를 거친다."
+            ),
+        ),
+        make_chunk(
+            doc_title="인사규정",
+            section_title="별표1 징계양정 기준",
+            permission="internal",
+            effective_from="2023-07-31",
+            effective_to="2025-12-30",
+            text=(
+                "2025년 12월 30일까지 적용되는 징계양정 기준은 비위 유형, 고의성, 피해 규모, "
+                "반복 여부를 종합하여 견책, 감봉, 정직, 해임으로 구분한다. 감사 결과가 확정되기 전에는 "
+                "징계 수위를 단정하지 않는다."
+            ),
+        ),
+        make_chunk(
+            doc_title="인사규정",
+            section_title="별표1 징계양정 기준",
+            permission="internal",
+            effective_from="2025-12-31",
+            text=(
+                "2025년 12월 31일부터 개정 징계양정 기준을 적용한다. 금품수수, 개인정보 유출, "
+                "반복적 복무 위반은 가중 사유로 보며, 감사부서의 사실관계 확인 자료와 인사위원회 의결을 "
+                "함께 반영한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="감사규정",
+            section_title="제12조 감사자료 제출 및 조사",
+            permission="audit",
+            effective_from="2024-05-20",
+            text=(
+                "감사부서는 감사 목적 달성에 필요한 자료 제출을 요구할 수 있다. 감사자료, 제보자 정보, "
+                "조사계획, 중간 감사 의견은 감사 권한을 가진 사용자에게만 공개한다. 일반 직원에게는 "
+                "비식별 처리된 결과만 제공한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="문서보안관리규정",
+            section_title="제7조 대외비 문서 열람",
+            permission="admin",
+            effective_from="2025-03-21",
+            text=(
+                "대외비 문서는 지정된 보안 등급과 직무상 필요성이 동시에 확인된 경우에만 열람할 수 있다. "
+                "열람, 다운로드, 출력 이력은 감사 로그로 남겨야 하며 권한이 없는 청크는 검색 단계에서 "
+                "제외한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="재난안전대책본부 운영지침",
+            section_title="제5조 특별지침 우선 적용",
+            permission="internal",
+            effective_from="2024-01-08",
+            text=(
+                "재난 또는 비상 대응 상황에서는 일반 복무 기준보다 재난안전대책본부 운영지침을 우선 적용한다. "
+                "상위 규정과 특별지침이 함께 검색되는 경우 사안의 성격, 특별 규정 여부, 시행일을 비교하여 "
+                "우선순위를 판단한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="회계규정",
+            section_title="제31조 계약과 지출",
+            permission="internal",
+            effective_from="2023-07-31",
+            text=(
+                "계약과 지출은 예산 편성 목적, 계약 절차, 검수 자료, 지출 증빙을 기준으로 처리한다. "
+                "예산 외 지출 또는 수의계약 예외 적용은 승인권자와 근거 조항을 함께 확인해야 한다."
+            ),
+        ),
+        make_chunk(
+            doc_title="내부통제 운영지침",
+            section_title="제9조 위험 점검",
+            permission="audit",
+            effective_from="2025-12-31",
+            text=(
+                "내부통제 점검은 회계, 인사, 계약, 정보보안 영역의 위험 신호를 주기적으로 확인한다. "
+                "중대한 위험은 감사계획과 연계하며, 개선조치 이행 여부를 별도 관리한다."
+            ),
+        ),
+    ]
+
+
+def seed_index(force: bool = False) -> dict[str, Any]:
+    ensure_dirs()
+    if INDEX_FILE.exists() and not force:
+        return read_json(INDEX_FILE, {"chunks": []})
+    payload = {
+        "version": 1,
+        "seeded_at": now_ms(),
+        "chunks": sample_chunks(),
+    }
+    write_json(INDEX_FILE, payload)
+    return payload
+
+
+def load_index() -> dict[str, Any]:
+    return seed_index(force=False)
+
+
+def save_chunks(chunks: list[dict[str, Any]]) -> None:
+    payload = load_index()
+    payload["chunks"] = chunks
+    payload["updated_at"] = now_ms()
+    write_json(INDEX_FILE, payload)
+
+
+def can_access(role: str, permission: str) -> bool:
+    return ROLE_LEVEL.get(role, 1) >= PERMISSION_LEVEL.get(permission, 1)
+
+
+def is_effective(chunk: dict[str, Any], as_of: str | None) -> bool:
+    if not as_of:
+        return True
+    point = parse_date_value(as_of)
+    if not point:
+        return True
+    start = parse_date_value(chunk.get("effective_from"))
+    end = parse_date_value(chunk.get("effective_to"))
+    if start and point < start:
+        return False
+    if end and point > end:
+        return False
+    return True
+
+
+def build_idf(chunks: list[dict[str, Any]]) -> dict[str, float]:
+    doc_count = max(len(chunks), 1)
+    df: Counter[str] = Counter()
+    for chunk in chunks:
+        df.update(set(chunk.get("tokens") or tokenize(chunk.get("text", ""))))
+    return {term: math.log((doc_count + 1) / (freq + 0.5)) + 1 for term, freq in df.items()}
+
+
+def score_chunk(chunk: dict[str, Any], terms: list[str], idf: dict[str, float]) -> tuple[float, list[str]]:
+    tokens = tokenize(f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}")
+    counts = Counter(tokens)
+    searchable = f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}".lower()
+    score = 0.0
+    matched: list[str] = []
+    for term in terms:
+        tf = counts.get(term, 0)
+        if tf:
+            score += (1 + math.log(tf)) * idf.get(term, 1.0)
+            matched.append(term)
+        elif term.lower() in searchable:
+            score += 0.55 * idf.get(term, 1.0)
+            matched.append(term)
+    if chunk.get("doc_title") and any(term in chunk["doc_title"].lower() for term in terms):
+        score += 1.5
+    if chunk.get("section_title") and any(term in chunk["section_title"].lower() for term in terms):
+        score += 1.2
+    return score, sorted(set(matched))
+
+
+def make_snippet(text: str, terms: list[str], size: int = 210) -> str:
+    if not text:
+        return ""
+    lowered = text.lower()
+    positions = [lowered.find(term.lower()) for term in terms if lowered.find(term.lower()) >= 0]
+    if positions:
+        start = max(min(positions) - 60, 0)
+    else:
+        start = 0
+    snippet = text[start : start + size]
+    if start > 0:
+        snippet = "..." + snippet
+    if start + size < len(text):
+        snippet += "..."
+    return snippet
+
+
+def split_sentences(text: str) -> list[str]:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return []
+    marked = re.sub(r"([.!?。])\s+", r"\1\n", cleaned)
+    marked = re.sub(r"(다\.|함\.|음\.|요\.)\s+", r"\1\n", marked)
+    marked = re.sub(r"\)\s+(?=제\d+조)", ")\n", marked)
+    parts = marked.splitlines()
+    sentences = [part.strip(" -") for part in parts if len(part.strip()) >= 12]
+    if sentences:
+        return sentences
+    return [cleaned[:260]]
+
+
+def summarize_text(text: str, terms: list[str], max_sentences: int = 3) -> str:
+    sentences = split_sentences(text)
+    if not sentences:
+        return "요약할 본문이 없습니다."
+    scored: list[tuple[float, int, str]] = []
+    for idx, sentence in enumerate(sentences):
+        lower = sentence.lower()
+        score = 0.0
+        for term in terms:
+            if term and term.lower() in lower:
+                score += 2.0
+        if re.search(r"목적|적용|심의|의결|제출|권한|위원회|계약|징계|보안|안전|자료", sentence):
+            score += 1.0
+        score += min(len(sentence), 180) / 300
+        scored.append((score, idx, sentence))
+    picked = sorted(scored, key=lambda item: (-item[0], item[1]))[:max_sentences]
+    ordered = sorted(picked, key=lambda item: item[1])
+    bullets = []
+    for _, _, sentence in ordered:
+        sentence = sentence.strip()
+        if len(sentence) > 240:
+            sentence = sentence[:237].rstrip() + "..."
+        bullets.append(f"- {sentence}")
+    return "\n".join(bullets)
+
+
+def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> dict[str, Any]:
+    payload = load_index()
+    chunks = payload.get("chunks", [])
+    explicit_or_detected_date = detect_date(query, as_of)
+    query_terms = expand_terms(tokenize(query))
+    idf = build_idf(chunks)
+
+    blocked_count = 0
+    date_filtered_count = 0
+    scored: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if not can_access(role, chunk.get("permission", "internal")):
+            blocked_count += 1
+            continue
+        if not is_effective(chunk, explicit_or_detected_date):
+            date_filtered_count += 1
+            continue
+        score, matched = score_chunk(chunk, query_terms, idf)
+        if score <= 0 and query_terms:
+            continue
+        if SENSITIVE_QUERY_TERMS.intersection(query_terms) and not SENSITIVE_MATCH_TERMS.intersection(matched):
+            continue
+        scored.append(
+            {
+                **{k: v for k, v in chunk.items() if k != "tokens"},
+                "score": round(score, 4),
+                "matched_terms": matched,
+                "snippet": make_snippet(chunk.get("text", ""), matched or query_terms),
+                "summary": summarize_text(chunk.get("text", ""), matched or query_terms),
+                "download": {
+                    "source": f"/api/download/source?id={chunk.get('id')}",
+                    "pdf": f"/api/download/result?id={chunk.get('id')}&format=pdf",
+                    "hwp": f"/api/download/result?id={chunk.get('id')}&format=hwp",
+                },
+            }
+        )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    results = scored[:limit]
+    return {
+        "query": query,
+        "role": role,
+        "role_label": ROLE_LABEL.get(role, role),
+        "as_of": explicit_or_detected_date,
+        "query_terms": query_terms,
+        "results": results,
+        "answer": generate_answer(query, results, role, explicit_or_detected_date, blocked_count, date_filtered_count),
+        "blocked_count": blocked_count,
+        "date_filtered_count": date_filtered_count,
+        "total_chunks": len(chunks),
+    }
+
+
+def generate_answer(
+    query: str,
+    results: list[dict[str, Any]],
+    role: str,
+    as_of: str | None,
+    blocked_count: int,
+    date_filtered_count: int,
+) -> str:
+    role_label = ROLE_LABEL.get(role, role)
+    date_part = f"{as_of} 기준" if as_of else "전체 시행시점"
+    if not results:
+        parts = [f"{role_label} 권한과 {date_part}으로 확인 가능한 근거를 찾지 못했습니다."]
+        if blocked_count:
+            parts.append(f"권한 때문에 제외된 청크가 {blocked_count}개 있습니다.")
+        if date_filtered_count:
+            parts.append(f"시행일 조건 때문에 제외된 청크가 {date_filtered_count}개 있습니다.")
+        return " ".join(parts)
+
+    top = results[0]
+    lead = (
+        f"{role_label} 권한과 {date_part}으로 보면 가장 직접적인 근거는 "
+        f"{top['doc_title']}의 {top['section_title']}입니다."
+    )
+    evidence = []
+    for i, item in enumerate(results[:3], 1):
+        page = f", p.{item['page']}" if item.get("page") else ""
+        period = item.get("effective_from") or "시행일 미상"
+        if item.get("effective_to"):
+            period += f"~{item['effective_to']}"
+        summary = item.get("summary") or summarize_text(item.get("text", ""), item.get("matched_terms", []))
+        evidence.append(
+            f"{i}. {item['doc_title']} / {item['section_title']}{page} "
+            f"[{PERMISSION_LABEL.get(item.get('permission'), item.get('permission'))}, {period}]\n"
+            f"요약:\n{summary}\n"
+            f"원문 일부: {item['snippet']}"
+        )
+
+    caution = []
+    if blocked_count:
+        caution.append(f"권한 필터로 {blocked_count}개 청크가 제외되었습니다.")
+    if date_filtered_count:
+        caution.append(f"시행일 필터로 {date_filtered_count}개 청크가 제외되었습니다.")
+    suffix = "\n\n필터 결과: " + " ".join(caution) if caution else ""
+    return lead + "\n\n근거:\n" + "\n".join(evidence) + suffix
+
+
+def split_text_into_chunks(text: str, max_chars: int = 900) -> list[tuple[str, str]]:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+(제\s*\d+\s*조\s*\()", r"\n\1", text)
+    text = re.sub(r"\s+(부\s*칙)", r"\n\1", text)
+    text = re.sub(r"\s+(\[별(?:표|지)\s*[^\]]+\])", r"\n\1", text)
+    lines = [normalize_space(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return []
+
+    chunks: list[tuple[str, str]] = []
+    current_title = "본문"
+    current: list[str] = []
+    heading_re = re.compile(r"^(제\s*\d+\s*[장절]|부\s*칙|\[별(?:표|지)\s*[^\]]+\]|[가-힣A-Za-z ]{2,40}(규정|지침|기준|총칙|부칙))")
+    article_re = re.compile(r"^(제\s*\d+\s*조\s*\([^)]{1,40}\))\s*(.*)$")
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        body = normalize_space(" ".join(current))
+        if body:
+            chunks.append((current_title, body))
+        current = []
+
+    for line in lines:
+        article = article_re.match(line)
+        if article:
+            flush()
+            current_title = article.group(1)
+            rest = article.group(2).strip()
+            if rest:
+                current.append(rest)
+            continue
+        is_heading = len(line) <= 60 and bool(heading_re.search(line))
+        if is_heading and current:
+            flush()
+            current_title = line
+            continue
+        if is_heading and not current:
+            current_title = line
+            continue
+        current.append(line)
+        if sum(len(x) for x in current) >= max_chars:
+            flush()
+    flush()
+    return chunks
+
+
+def guess_permission(title: str, text: str) -> str:
+    source = f"{title} {text}"
+    if re.search(r"대외비|비밀|관리자|보안등급|개인정보|열람 이력", source):
+        return "admin"
+    if re.search(r"감사|조사|제보|징계|내부통제", source):
+        return "audit"
+    if re.search(r"정관|공개|총칙", source):
+        return "public"
+    return "internal"
+
+
+def extract_pdf(path: Path) -> list[dict[str, Any]]:
+    if pdfplumber is None:
+        raise RuntimeError("pdfplumber is not available in this runtime")
+    chunks: list[dict[str, Any]] = []
+    doc_title = path.stem
+    effective_from = date_from_text(path.name)
+    with pdfplumber.open(path) as pdf:
+        for page_number, page in enumerate(pdf.pages, 1):
+            text = page.extract_text(x_tolerance=1, y_tolerance=3, layout=False) or ""
+            for section_title, body in split_text_into_chunks(text):
+                chunks.append(
+                    make_chunk(
+                        doc_title=doc_title,
+                        section_title=section_title,
+                        text=body,
+                        permission=guess_permission(doc_title + " " + section_title, body),
+                        effective_from=effective_from,
+                        page=page_number,
+                        source_file=path.name,
+                        source_type="pdf",
+                        source_path=str(path.resolve()),
+                    )
+                )
+    return chunks
+
+
+def extract_hwpx(path: Path) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    doc_title = path.stem
+    effective_from = date_from_text(path.name)
+    parts: list[str] = []
+    with zipfile.ZipFile(path) as zf:
+        for name in zf.namelist():
+            if not name.lower().endswith(".xml"):
+                continue
+            if "content" not in name.lower() and "section" not in name.lower():
+                continue
+            try:
+                data = zf.read(name).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            texts = re.findall(r">([^<>]{2,})<", data)
+            parts.extend(t.strip() for t in texts if t.strip())
+    text = "\n".join(parts)
+    for section_title, body in split_text_into_chunks(text):
+        chunks.append(
+            make_chunk(
+                doc_title=doc_title,
+                section_title=section_title,
+                text=body,
+                permission=guess_permission(doc_title + " " + section_title, body),
+                effective_from=effective_from,
+                source_file=path.name,
+                source_type="hwpx",
+                source_path=str(path.resolve()),
+            )
+        )
+    return chunks
+
+
+def extract_hwp_text(path: Path) -> str:
+    if not HWP5TXT.exists():
+        raise RuntimeError("hwp5txt is not available")
+    completed = subprocess.run(
+        [str(HWP5TXT), str(path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    text = completed.stdout.strip()
+    if not text:
+        raise RuntimeError("hwp5txt returned empty text")
+    return text
+
+
+def extract_hwp(path: Path) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    doc_title = path.stem
+    effective_from = date_from_text(path.name)
+    text = extract_hwp_text(path)
+    for section_title, body in split_text_into_chunks(text, max_chars=1000):
+        chunks.append(
+            make_chunk(
+                doc_title=doc_title,
+                section_title=section_title,
+                text=body,
+                permission=guess_permission(doc_title + " " + section_title, body),
+                effective_from=effective_from,
+                source_file=path.name,
+                source_type="hwp",
+                source_path=str(path.resolve()),
+            )
+        )
+    if chunks:
+        return chunks
+    return [
+        make_chunk(
+            doc_title=doc_title,
+            section_title="본문",
+            text=text,
+            permission=guess_permission(doc_title, text),
+            effective_from=effective_from,
+            source_file=path.name,
+            source_type="hwp",
+            source_path=str(path.resolve()),
+        )
+    ]
+
+
+def ingest_file(path: Path) -> list[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return extract_pdf(path)
+    if suffix == ".hwpx":
+        return extract_hwpx(path)
+    if suffix == ".hwp":
+        return extract_hwp(path)
+    if suffix == ".zip":
+        return ingest_zip(path)
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def ingest_zip(path: Path) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="reg-rag-zip-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        with zipfile.ZipFile(path) as zf:
+            zf.extractall(tmp_path)
+        for file_path in tmp_path.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in {".pdf", ".hwpx", ".hwp"}:
+                continue
+            try:
+                extracted = ingest_file(file_path)
+                for chunk in extracted:
+                    chunk["batch_source"] = path.name
+                chunks.extend(extracted)
+            except Exception:
+                chunks.append(
+                    make_chunk(
+                        doc_title=file_path.stem,
+                        section_title="색인 실패",
+                        text=f"{file_path.name} 파일은 현재 프로토타입에서 전문을 추출하지 못했습니다.",
+                        permission=guess_permission(file_path.stem, file_path.stem),
+                        source_file=file_path.name,
+                        source_type=file_path.suffix.lower().lstrip("."),
+                        source_path=str(path.resolve()),
+                    )
+                )
+    return chunks
+
+
+def add_chunks(new_chunks: list[dict[str, Any]]) -> int:
+    payload = load_index()
+    chunks = payload.get("chunks", [])
+    chunks.extend(new_chunks)
+    payload["chunks"] = chunks
+    payload["updated_at"] = now_ms()
+    write_json(INDEX_FILE, payload)
+    return len(new_chunks)
+
+
+def document_summary() -> list[dict[str, Any]]:
+    chunks = load_index().get("chunks", [])
+    grouped: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        title = chunk.get("doc_title", "문서")
+        item = grouped.setdefault(
+            title,
+            {
+                "doc_title": title,
+                "chunk_count": 0,
+                "source_types": set(),
+                "permissions": set(),
+                "effective_from": None,
+                "effective_to": None,
+            },
+        )
+        item["chunk_count"] += 1
+        item["source_types"].add(chunk.get("source_type", "sample"))
+        item["permissions"].add(chunk.get("permission", "internal"))
+        start = chunk.get("effective_from")
+        end = chunk.get("effective_to")
+        if start and (item["effective_from"] is None or start < item["effective_from"]):
+            item["effective_from"] = start
+        if end and (item["effective_to"] is None or end > item["effective_to"]):
+            item["effective_to"] = end
+    result: list[dict[str, Any]] = []
+    for item in grouped.values():
+        item["source_types"] = sorted(item["source_types"])
+        item["permissions"] = sorted(item["permissions"], key=lambda p: PERMISSION_LEVEL.get(p, 9))
+        result.append(item)
+    result.sort(key=lambda x: x["doc_title"])
+    return result
+
+
+def local_sources() -> list[Path]:
+    regulation_dirs = [
+        path
+        for path in WORKSPACE_DIR.iterdir()
+        if path.is_dir()
+        and "정관" in unicodedata.normalize("NFC", path.name)
+        and "규정" in unicodedata.normalize("NFC", path.name)
+        and path.name != ROOT.name
+    ]
+    if regulation_dirs:
+        files: list[Path] = []
+        for directory in regulation_dirs:
+            files.extend(
+                path
+                for path in directory.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".pdf", ".hwpx", ".hwp"}
+            )
+        return sorted(files, key=lambda p: str(p))
+
+    files = []
+    for path in WORKSPACE_DIR.iterdir():
+        if path.is_file() and path.suffix.lower() in {".pdf", ".hwpx", ".hwp", ".zip"}:
+            if "내부망 규정 검색" in path.name or "내부망 규정 검색" in path.name:
+                continue
+            files.append(path)
+    return sorted(files, key=lambda p: str(p))
+
+
+def ingest_local_sources() -> dict[str, Any]:
+    imported = 0
+    errors: list[str] = []
+    seen_sources = {
+        source
+        for chunk in load_index().get("chunks", [])
+        for source in (chunk.get("source_path"), chunk.get("source_file"), chunk.get("batch_source"))
+        if source
+    }
+    for source in local_sources():
+        if str(source.resolve()) in seen_sources or source.name in seen_sources:
+            continue
+        try:
+            imported += add_chunks(ingest_file(source))
+        except Exception as exc:
+            errors.append(f"{source.name}: {exc}")
+    return {"imported_chunks": imported, "errors": errors, "documents": document_summary()}
+
+
+def safe_upload_name(filename: str) -> str:
+    stem = Path(filename).stem[:80] or "upload"
+    suffix = Path(filename).suffix.lower()
+    stem = re.sub(r"[^\w가-힣(). -]+", "_", stem, flags=re.UNICODE).strip()
+    return f"{int(time.time())}_{stem}{suffix}"
+
+
+def get_chunk_by_id(chunk_id_value: str) -> dict[str, Any] | None:
+    for chunk in load_index().get("chunks", []):
+        if chunk.get("id") == chunk_id_value:
+            return chunk
+    return None
+
+
+def safe_download_name(name: str, suffix: str) -> str:
+    stem = Path(name).stem[:80] or "download"
+    stem = re.sub(r"[^\w가-힣(). -]+", "_", stem, flags=re.UNICODE).strip() or "download"
+    return f"{stem}{suffix}"
+
+
+def is_safe_source(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    allowed_roots = [WORKSPACE_DIR.resolve(), UPLOADS_DIR.resolve()]
+    return any(resolved == root or root in resolved.parents for root in allowed_roots)
+
+
+def send_bytes(
+    handler: BaseHTTPRequestHandler,
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+) -> None:
+    encoded_name = quote(filename)
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded_name}")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> None:
+    source_path = chunk.get("source_path")
+    if not source_path:
+        handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+        return
+    path = Path(source_path)
+    if not path.exists() or not path.is_file() or not is_safe_source(path):
+        handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+        return
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    send_bytes(handler, path.read_bytes(), filename=path.name, content_type=content_type)
+
+
+def result_payload(chunk: dict[str, Any]) -> dict[str, str]:
+    summary = summarize_text(chunk.get("text", ""), chunk.get("tokens", [])[:12])
+    period = chunk.get("effective_from") or "시행일 미상"
+    if chunk.get("effective_to"):
+        period += f" ~ {chunk.get('effective_to')}"
+    source = chunk.get("source_file") or "sample"
+    return {
+        "title": str(chunk.get("doc_title") or "검색 결과"),
+        "section": str(chunk.get("section_title") or "본문"),
+        "permission": PERMISSION_LABEL.get(chunk.get("permission"), str(chunk.get("permission"))),
+        "period": period,
+        "source": source,
+        "summary": summary,
+        "text": str(chunk.get("text") or ""),
+    }
+
+
+def register_pdf_font() -> str:
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    font_candidates = [
+        "/Users/leeseungbo/Library/Fonts/NanumSquareNeo-Variable.ttf",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/Supplemental/NotoSansGothic-Regular.ttf",
+    ]
+    for font_path in font_candidates:
+        if Path(font_path).exists():
+            try:
+                pdfmetrics.registerFont(TTFont("RegRagKorean", font_path))
+                return "RegRagKorean"
+            except Exception:
+                continue
+    return "Helvetica"
+
+
+def make_result_pdf_with_bundled_python(chunk: dict[str, Any]) -> bytes:
+    if os.environ.get("REG_RAG_PDF_CHILD") == "1" or not BUNDLED_PYTHON.exists():
+        raise ModuleNotFoundError("reportlab")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        input_path = tmp_path / "chunk.json"
+        output_path = tmp_path / "result.pdf"
+        input_path.write_text(json.dumps(chunk, ensure_ascii=False), encoding="utf-8")
+        script = """
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ["REG_RAG_PDF_CHILD"] = "1"
+import server
+
+chunk = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+Path(sys.argv[2]).write_bytes(server.make_result_pdf(chunk))
+"""
+        proc = subprocess.run(
+            [str(BUNDLED_PYTHON), "-c", script, str(input_path), str(output_path)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        if proc.returncode != 0 or not output_path.exists():
+            detail = (proc.stderr or proc.stdout or "PDF generator failed").strip()
+            raise RuntimeError(f"PDF 생성 실패: {detail[:500]}")
+        return output_path.read_bytes()
+
+
+def make_result_pdf(chunk: dict[str, Any]) -> bytes:
+    try:
+        return make_result_pdf_reportlab(chunk)
+    except ImportError:
+        return make_result_pdf_with_bundled_python(chunk)
+
+
+def make_result_pdf_reportlab(chunk: dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    payload = result_payload(chunk)
+    font_name = register_pdf_font()
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "RegTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=17,
+        leading=23,
+        alignment=0,
+        textColor=colors.HexColor("#202321"),
+    )
+    meta_style = ParagraphStyle(
+        "RegMeta",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=9,
+        leading=14,
+        textColor=colors.HexColor("#68726b"),
+    )
+    body_style = ParagraphStyle(
+        "RegBody",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=10.5,
+        leading=17,
+        spaceAfter=8,
+    )
+    story = [
+        Paragraph(html.escape(payload["title"]), title_style),
+        Paragraph(html.escape(payload["section"]), body_style),
+        Paragraph(
+            html.escape(f"권한: {payload['permission']} | 시행: {payload['period']} | 출처: {payload['source']}"),
+            meta_style,
+        ),
+        Spacer(1, 8),
+        Paragraph("요약", body_style),
+        Paragraph(html.escape(payload["summary"]).replace("\n", "<br/>"), body_style),
+        Spacer(1, 8),
+        Paragraph("원문", body_style),
+    ]
+    text = payload["text"][:7000]
+    for paragraph in re.split(r"\n{2,}", text):
+        story.append(Paragraph(html.escape(paragraph).replace("\n", "<br/>"), body_style))
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def make_result_hwp_html(chunk: dict[str, Any]) -> bytes:
+    payload = result_payload(chunk)
+    body = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(payload['title'])}</title>
+  <style>
+    body {{ font-family: "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; line-height: 1.7; padding: 28px; color: #202321; }}
+    h1 {{ font-size: 22px; }}
+    h2 {{ font-size: 16px; margin-top: 24px; }}
+    .meta {{ color: #68726b; border-top: 1px solid #d7dbd2; border-bottom: 1px solid #d7dbd2; padding: 10px 0; }}
+    pre {{ white-space: pre-wrap; font-family: inherit; }}
+  </style>
+</head>
+<body>
+  <h1>{html.escape(payload['title'])}</h1>
+  <h2>{html.escape(payload['section'])}</h2>
+  <p class="meta">권한: {html.escape(payload['permission'])} | 시행: {html.escape(payload['period'])} | 출처: {html.escape(payload['source'])}</p>
+  <h2>요약</h2>
+  <pre>{html.escape(payload['summary'])}</pre>
+  <h2>원문</h2>
+  <pre>{html.escape(payload['text'][:12000])}</pre>
+</body>
+</html>
+"""
+    return body.encode("utf-8")
+
+
+def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def static_response(handler: BaseHTTPRequestHandler, path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        handler.send_error(HTTPStatus.NOT_FOUND)
+        return
+    content_type = "text/plain; charset=utf-8"
+    if path.suffix == ".html":
+        content_type = "text/html; charset=utf-8"
+    elif path.suffix == ".css":
+        content_type = "text/css; charset=utf-8"
+    elif path.suffix == ".js":
+        content_type = "application/javascript; charset=utf-8"
+    data = path.read_bytes()
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+class RegRagHandler(BaseHTTPRequestHandler):
+    server_version = "RegRAGPrototype/0.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        data = self.rfile.read(length)
+        return json.loads(data.decode("utf-8"))
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        if path == "/":
+            static_response(self, STATIC_DIR / "index.html")
+            return
+        if path.startswith("/static/"):
+            static_response(self, STATIC_DIR / path.replace("/static/", "", 1))
+            return
+        if path == "/api/health":
+            json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "chunks": len(load_index().get("chunks", [])),
+                    "pdfplumber": pdfplumber is not None,
+                },
+            )
+            return
+        if path == "/api/documents":
+            json_response(self, HTTPStatus.OK, {"documents": document_summary()})
+            return
+        if path == "/api/chunks":
+            qs = parse_qs(parsed.query)
+            limit = int((qs.get("limit") or ["25"])[0])
+            chunks = [{k: v for k, v in c.items() if k != "tokens"} for c in load_index().get("chunks", [])[:limit]]
+            json_response(self, HTTPStatus.OK, {"chunks": chunks})
+            return
+        if path == "/api/download/source":
+            qs = parse_qs(parsed.query)
+            chunk = get_chunk_by_id((qs.get("id") or [""])[0])
+            if not chunk:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            source_download(self, chunk)
+            return
+        if path == "/api/download/result":
+            qs = parse_qs(parsed.query)
+            chunk = get_chunk_by_id((qs.get("id") or [""])[0])
+            fmt = (qs.get("format") or ["pdf"])[0].lower()
+            if not chunk:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if fmt == "hwp":
+                filename = safe_download_name(f"{chunk.get('doc_title', 'result')}_검색결과", ".hwp")
+                send_bytes(
+                    self,
+                    make_result_hwp_html(chunk),
+                    filename=filename,
+                    content_type="application/x-hwp; charset=utf-8",
+                )
+                return
+            filename = safe_download_name(f"{chunk.get('doc_title', 'result')}_검색결과", ".pdf")
+            send_bytes(self, make_result_pdf(chunk), filename=filename, content_type="application/pdf")
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/search":
+                body = self.read_json_body()
+                result = search_index(
+                    query=str(body.get("query", "")),
+                    role=str(body.get("role", "employee")),
+                    as_of=body.get("as_of"),
+                    limit=int(body.get("limit", 6)),
+                )
+                json_response(self, HTTPStatus.OK, result)
+                return
+            if path == "/api/upload":
+                body = self.read_json_body()
+                filename = str(body.get("filename", "upload.pdf"))
+                content_b64 = str(body.get("content_base64", ""))
+                if not content_b64:
+                    json_response(self, HTTPStatus.BAD_REQUEST, {"error": "content_base64 is required"})
+                    return
+                target = UPLOADS_DIR / safe_upload_name(filename)
+                target.write_bytes(base64.b64decode(content_b64))
+                count = add_chunks(ingest_file(target))
+                json_response(self, HTTPStatus.OK, {"imported_chunks": count, "documents": document_summary()})
+                return
+            if path == "/api/ingest-local":
+                json_response(self, HTTPStatus.OK, ingest_local_sources())
+                return
+            if path == "/api/reset":
+                seed_index(force=True)
+                if UPLOADS_DIR.exists():
+                    for child in UPLOADS_DIR.iterdir():
+                        if child.is_file():
+                            child.unlink()
+                        elif child.is_dir():
+                            shutil.rmtree(child)
+                json_response(self, HTTPStatus.OK, {"documents": document_summary()})
+                return
+            json_response(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except Exception as exc:
+            json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Internal regulation RAG prototype")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument("--reset", action="store_true", help="reset sample index before serving")
+    args = parser.parse_args()
+
+    seed_index(force=args.reset)
+    server = ThreadingHTTPServer((args.host, args.port), RegRagHandler)
+    print(f"RegRAG prototype running at http://{args.host}:{args.port}")
+    print(f"Workspace: {WORKSPACE_DIR}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

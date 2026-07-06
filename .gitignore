@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local runtime data
+data/*.json
+uploads/
+tmp/
+
+# Internal source documents must stay local unless explicitly approved.
+*.hwp
+*.hwpx
+*.pdf
+*.zip
+
+# Local env files
+.env
+.venv/
+venv/
