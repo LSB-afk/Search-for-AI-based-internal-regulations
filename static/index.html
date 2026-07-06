@@ -19,6 +19,8 @@
         </div>
       </header>
 
+      <nav id="category-rail" class="category-rail" aria-label="규정 항목"></nav>
+
       <main class="workspace">
         <aside class="control-panel" aria-label="검색 조건">
           <section class="panel-section">
@@ -47,6 +49,10 @@
             <div class="metric-line">
               <span>문서</span>
               <strong id="doc-count">0</strong>
+            </div>
+            <div class="metric-line">
+              <span>규정</span>
+              <strong id="regulation-metric">0</strong>
             </div>
             <div class="metric-line">
               <span>청크</span>
@@ -86,13 +92,29 @@
           </section>
         </section>
 
-        <aside class="documents-panel" aria-label="색인 문서">
+        <aside class="documents-panel" aria-label="규정 문서 하네스">
           <div class="section-title">
-            <h2>색인 문서</h2>
+            <h2>규정 문서 하네스</h2>
+            <span id="regulation-count">0건</span>
           </div>
+          <input id="document-filter" class="document-filter" type="search" placeholder="문서명 검색" />
+          <div id="harness-summary" class="harness-summary"></div>
           <div id="documents" class="document-list"></div>
         </aside>
       </main>
+
+      <section class="category-stage" aria-label="항목별 규정 화면">
+        <div class="category-stage-head">
+          <div>
+            <p id="category-kicker" class="kicker">Regulation Sections</p>
+            <h2 id="category-title">전체 규정</h2>
+          </div>
+          <span id="category-count">0건</span>
+        </div>
+        <div id="category-snapshot" class="category-snapshot"></div>
+        <div id="category-queries" class="category-queries"></div>
+        <div id="category-documents" class="category-documents"></div>
+      </section>
 
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </div>
