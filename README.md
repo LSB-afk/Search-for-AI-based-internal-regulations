@@ -92,7 +92,7 @@ GitHub에는 내부 문서를 올리지 않으므로, 실제 운영 서버에서
 https://lsb-afk.github.io/Search-for-AI-based-internal-regulations/
 ```
 
-이 URL은 기본적으로 현재 PC의 로컬 검색 API(`http://127.0.0.1:8765`)에 연결합니다. 실제 HWP 규정 검색을 하려면 로컬에서 서버가 실행 중이어야 합니다.
+이 URL은 기본적으로 현재 PC의 로컬 검색 API(`http://127.0.0.1:8765`)에 연결합니다. 실제 HWP 규정 검색을 하려면 로컬에서 서버가 실행 중이어야 합니다. Chrome에서 로컬 네트워크 접근 권한을 묻는 경우 허용해야 검색됩니다.
 
 별도 HTTPS 백엔드 API를 연결할 때는 다음처럼 엽니다.
 

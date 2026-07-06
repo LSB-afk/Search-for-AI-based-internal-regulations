@@ -8,9 +8,36 @@ const isGitHubPages = window.location.hostname.endsWith("github.io");
 const params = new URLSearchParams(window.location.search);
 const defaultApiBase = isGitHubPages ? "http://127.0.0.1:8765" : "";
 const apiBase = String(params.get("api") || window.REG_RAG_API_BASE || defaultApiBase).replace(/\/$/, "");
+const shouldUseLoopbackTarget = isLoopbackApi(apiBase) && supportsLoopbackTargetAddress();
 
 const qs = (selector) => document.querySelector(selector);
 const qsa = (selector) => Array.from(document.querySelectorAll(selector));
+
+function isLoopbackApi(base) {
+  if (!base) return false;
+  try {
+    const hostname = new URL(base).hostname;
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+  } catch (error) {
+    return false;
+  }
+}
+
+function supportsLoopbackTargetAddress() {
+  if (typeof Request === "undefined") return false;
+  try {
+    return new Request("http://127.0.0.1", { targetAddressSpace: "loopback" }).targetAddressSpace === "loopback";
+  } catch (error) {
+    return false;
+  }
+}
+
+function apiFailureMessage() {
+  if (isGitHubPages && isLoopbackApi(apiBase)) {
+    return "로컬 검색 서버에 연결하지 못했습니다. 127.0.0.1:8765 서버를 실행하고, 브라우저가 묻는 로컬 네트워크 접근 권한을 허용하세요.";
+  }
+  return "검색 서버 연결에 실패했습니다.";
+}
 
 function showToast(message) {
   const toast = qs("#toast");
@@ -21,10 +48,14 @@ function showToast(message) {
 
 async function api(path, options = {}) {
   const url = apiBase ? `${apiBase}${path}` : path;
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  const fetchOptions = {
     ...options,
-  });
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  };
+  if (shouldUseLoopbackTarget) {
+    fetchOptions.targetAddressSpace = "loopback";
+  }
+  const response = await fetch(url, fetchOptions);
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || `HTTP ${response.status}`);
@@ -160,16 +191,25 @@ async function runSearch() {
     return;
   }
   qs("#answer-output").textContent = "검색 중...";
-  const payload = await api("/api/search", {
-    method: "POST",
-    body: JSON.stringify({
-      query,
-      role: state.role,
-      as_of: qs("#as-of").value,
-      limit: 6,
-    }),
-  });
-  renderResults(payload);
+  try {
+    const payload = await api("/api/search", {
+      method: "POST",
+      body: JSON.stringify({
+        query,
+        role: state.role,
+        as_of: qs("#as-of").value,
+        limit: 6,
+      }),
+    });
+    renderResults(payload);
+  } catch (error) {
+    const message = apiFailureMessage(error);
+    qs("#answer-output").textContent = message;
+    qs("#result-count").textContent = "0건";
+    qs("#filter-summary").textContent = "";
+    qs("#results").innerHTML = "";
+    throw new Error(message);
+  }
 }
 
 function fileToBase64(file) {
