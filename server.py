@@ -76,6 +76,30 @@ STOPWORDS = {
     "으로써",
 }
 
+
+def configured_source_roots() -> list[Path]:
+    roots: list[Path] = []
+    env_value = os.environ.get("REG_RAG_SOURCE_DIRS", "")
+    for raw_path in env_value.split(os.pathsep):
+        raw_path = raw_path.strip()
+        if raw_path:
+            roots.append(Path(raw_path).expanduser())
+    roots.extend([WORKSPACE_DIR, ROOT])
+
+    resolved_roots: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            continue
+        if resolved in seen or not resolved.exists() or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        resolved_roots.append(resolved)
+    return resolved_roots
+
+
 SENSITIVE_QUERY_TERMS = {"대외비", "비밀", "개인정보"}
 SENSITIVE_MATCH_TERMS = {"대외비", "비밀", "개인정보", "보안", "비공개"}
 
@@ -119,10 +143,12 @@ def now_ms() -> int:
 
 
 def normalize_space(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def tokenize(text: str) -> list[str]:
+    text = unicodedata.normalize("NFC", text)
     raw = re.findall(r"[가-힣A-Za-z0-9]{2,}", text.lower())
     tokens: list[str] = []
     for token in raw:
@@ -390,14 +416,17 @@ def build_idf(chunks: list[dict[str, Any]]) -> dict[str, float]:
     doc_count = max(len(chunks), 1)
     df: Counter[str] = Counter()
     for chunk in chunks:
-        df.update(set(chunk.get("tokens") or tokenize(chunk.get("text", ""))))
+        df.update(set(tokenize(f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}")))
     return {term: math.log((doc_count + 1) / (freq + 0.5)) + 1 for term, freq in df.items()}
 
 
 def score_chunk(chunk: dict[str, Any], terms: list[str], idf: dict[str, float]) -> tuple[float, list[str]]:
     tokens = tokenize(f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}")
     counts = Counter(tokens)
-    searchable = f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}".lower()
+    title = unicodedata.normalize("NFC", str(chunk.get("doc_title", "")))
+    section = unicodedata.normalize("NFC", str(chunk.get("section_title", "")))
+    body = unicodedata.normalize("NFC", str(chunk.get("text", "")))
+    searchable = f"{title} {section} {body}".lower()
     score = 0.0
     matched: list[str] = []
     for term in terms:
@@ -408,9 +437,9 @@ def score_chunk(chunk: dict[str, Any], terms: list[str], idf: dict[str, float]) 
         elif term.lower() in searchable:
             score += 0.55 * idf.get(term, 1.0)
             matched.append(term)
-    if chunk.get("doc_title") and any(term in chunk["doc_title"].lower() for term in terms):
+    if title and any(term in title.lower() for term in terms):
         score += 1.5
-    if chunk.get("section_title") and any(term in chunk["section_title"].lower() for term in terms):
+    if section and any(term in section.lower() for term in terms):
         score += 1.2
     return score, sorted(set(matched))
 
@@ -478,6 +507,7 @@ def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> di
     explicit_or_detected_date = detect_date(query, as_of)
     query_terms = expand_terms(tokenize(query))
     idf = build_idf(chunks)
+    real_source_available = any(chunk.get("source_type") != "sample" for chunk in chunks)
 
     blocked_count = 0
     date_filtered_count = 0
@@ -492,6 +522,11 @@ def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> di
         score, matched = score_chunk(chunk, query_terms, idf)
         if score <= 0 and query_terms:
             continue
+        if real_source_available:
+            if chunk.get("source_type") == "sample":
+                score *= 0.35
+            else:
+                score += 1.5
         if SENSITIVE_QUERY_TERMS.intersection(query_terms) and not SENSITIVE_MATCH_TERMS.intersection(matched):
             continue
         scored.append(
@@ -833,7 +868,8 @@ def document_summary() -> list[dict[str, Any]]:
 def local_sources() -> list[Path]:
     regulation_dirs = [
         path
-        for path in WORKSPACE_DIR.iterdir()
+        for root in configured_source_roots()
+        for path in root.iterdir()
         if path.is_dir()
         and "정관" in unicodedata.normalize("NFC", path.name)
         and "규정" in unicodedata.normalize("NFC", path.name)
@@ -850,11 +886,12 @@ def local_sources() -> list[Path]:
         return sorted(files, key=lambda p: str(p))
 
     files = []
-    for path in WORKSPACE_DIR.iterdir():
-        if path.is_file() and path.suffix.lower() in {".pdf", ".hwpx", ".hwp", ".zip"}:
-            if "내부망 규정 검색" in path.name or "내부망 규정 검색" in path.name:
-                continue
-            files.append(path)
+    for root in configured_source_roots():
+        for path in root.iterdir():
+            if path.is_file() and path.suffix.lower() in {".pdf", ".hwpx", ".hwp", ".zip"}:
+                if "내부망 규정 검색" in path.name or "내부망 규정 검색" in path.name:
+                    continue
+                files.append(path)
     return sorted(files, key=lambda p: str(p))
 
 
@@ -902,7 +939,7 @@ def is_safe_source(path: Path) -> bool:
         resolved = path.resolve()
     except Exception:
         return False
-    allowed_roots = [WORKSPACE_DIR.resolve(), UPLOADS_DIR.resolve()]
+    allowed_roots = configured_source_roots() + [UPLOADS_DIR.resolve()]
     return any(resolved == root or root in resolved.parents for root in allowed_roots)
 
 
@@ -1254,9 +1291,18 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--reset", action="store_true", help="reset sample index before serving")
+    parser.add_argument("--ingest-local", action="store_true", help="index local regulation source folders before serving")
     args = parser.parse_args()
 
     seed_index(force=args.reset)
+    if args.ingest_local or os.environ.get("REG_RAG_AUTO_INGEST") == "1":
+        result = ingest_local_sources()
+        print(
+            "Local ingest: "
+            f"{result['imported_chunks']} chunks, "
+            f"{len(result['documents'])} documents, "
+            f"{len(result['errors'])} errors"
+        )
     server = ThreadingHTTPServer((args.host, args.port), RegRagHandler)
     print(f"RegRAG prototype running at http://{args.host}:{args.port}")
     print(f"Workspace: {WORKSPACE_DIR}")

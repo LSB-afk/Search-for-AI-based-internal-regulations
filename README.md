@@ -27,6 +27,20 @@ python3 server.py
 curl -X POST http://127.0.0.1:8765/api/ingest-local
 ```
 
+서버 시작과 동시에 색인하려면 다음처럼 실행합니다.
+
+```bash
+python3 server.py --ingest-local
+```
+
+규정 폴더가 앱 폴더 밖에 있거나 배포 서버에서 별도 볼륨으로 붙어 있으면 `REG_RAG_SOURCE_DIRS`에 지정합니다. 여러 경로는 macOS/Linux 기준 `:`로 구분합니다.
+
+```bash
+REG_RAG_SOURCE_DIRS="/path/to/(붙임1) 정관 및 규정(기준일 2026.5.27.)" \
+REG_RAG_AUTO_INGEST=1 \
+python3 server.py --host 0.0.0.0 --port 8765
+```
+
 HWP 본문 파싱은 `hwp5txt`를 사용합니다. 자동 탐색이 안 되면 환경변수로 경로를 지정합니다.
 
 ```bash
@@ -45,6 +59,31 @@ REG_RAG_PDF_PYTHON=/path/to/python3 python3 server.py
 docker build -t internal-reg-rag .
 docker run --rm -p 8765:8765 internal-reg-rag
 ```
+
+규정 폴더를 Docker 컨테이너에 붙여 자동 색인하려면 다음처럼 실행합니다.
+
+```bash
+docker run --rm -p 8765:8765 \
+  -e REG_RAG_SOURCE_DIRS=/sources \
+  -e REG_RAG_AUTO_INGEST=1 \
+  -v "/path/to/(붙임1) 정관 및 규정(기준일 2026.5.27.)":/sources:ro \
+  internal-reg-rag
+```
+
+## GitHub 배포
+
+`main` 브랜치에 push하면 GitHub Actions가 두 가지를 수행합니다.
+
+- `smoke`: 서버 문법 검사와 기본 API smoke test
+- `docker-publish`: GitHub Container Registry에 서버 이미지 배포
+
+이미지 주소:
+
+```bash
+ghcr.io/lsb-afk/search-for-ai-based-internal-regulations:latest
+```
+
+GitHub에는 내부 문서를 올리지 않으므로, 실제 운영 서버에서는 위 Docker 실행 예시처럼 규정 폴더를 별도 볼륨으로 붙여야 합니다.
 
 ## 현재 구현 범위
 
