@@ -108,8 +108,7 @@ function renderResults(payload) {
       const period = [item.effective_from || "시행일 미상", item.effective_to || ""].filter(Boolean).join(" ~ ");
       const page = item.page ? `p.${item.page}` : "page 없음";
       const sourceHref = item.download && item.source_path ? item.download.source : "";
-      const pdfHref = item.download ? item.download.pdf : "";
-      const hwpHref = item.download ? item.download.hwp : "";
+      const sourcePdfHref = item.download && item.source_path ? item.download.source_pdf : "";
       return `
         <article class="result-card">
           <div class="result-title">
@@ -132,8 +131,7 @@ function renderResults(payload) {
           </div>
           <div class="download-row">
             ${sourceHref ? `<a class="download-button" href="${sourceHref}">원본 ${escapeHtml((item.source_type || "").toUpperCase())}</a>` : ""}
-            ${pdfHref ? `<a class="download-button" href="${pdfHref}">PDF 요약</a>` : ""}
-            ${hwpHref ? `<a class="download-button" href="${hwpHref}">HWP 요약</a>` : ""}
+            ${sourcePdfHref ? `<a class="download-button" href="${sourcePdfHref}">원본 PDF</a>` : ""}
           </div>
         </article>
       `;

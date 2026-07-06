@@ -538,8 +538,7 @@ def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> di
                 "summary": summarize_text(chunk.get("text", ""), matched or query_terms),
                 "download": {
                     "source": f"/api/download/source?id={chunk.get('id')}",
-                    "pdf": f"/api/download/result?id={chunk.get('id')}&format=pdf",
-                    "hwp": f"/api/download/result?id={chunk.get('id')}&format=hwp",
+                    "source_pdf": f"/api/download/source-pdf?id={chunk.get('id')}",
                 },
             }
         )
@@ -972,6 +971,34 @@ def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> N
     send_bytes(handler, path.read_bytes(), filename=path.name, content_type=content_type)
 
 
+def source_chunks(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    source_path = chunk.get("source_path")
+    if not source_path:
+        return [chunk]
+    chunks = [
+        item
+        for item in load_index().get("chunks", [])
+        if item.get("source_path") == source_path
+    ]
+    return chunks or [chunk]
+
+
+def source_pdf_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> None:
+    source_path = chunk.get("source_path")
+    if not source_path:
+        handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+        return
+    path = Path(source_path)
+    if not path.exists() or not path.is_file() or not is_safe_source(path):
+        handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+        return
+    if path.suffix.lower() == ".pdf":
+        send_bytes(handler, path.read_bytes(), filename=path.name, content_type="application/pdf")
+        return
+    filename = safe_download_name(f"{path.stem}_원본", ".pdf")
+    send_bytes(handler, make_source_pdf(chunk), filename=filename, content_type="application/pdf")
+
+
 def result_payload(chunk: dict[str, Any]) -> dict[str, str]:
     summary = summarize_text(chunk.get("text", ""), chunk.get("tokens", [])[:12])
     period = chunk.get("effective_from") or "시행일 미상"
@@ -1048,6 +1075,123 @@ def make_result_pdf(chunk: dict[str, Any]) -> bytes:
         return make_result_pdf_reportlab(chunk)
     except ImportError:
         return make_result_pdf_with_bundled_python(chunk)
+
+
+def make_source_pdf_with_bundled_python(chunk: dict[str, Any]) -> bytes:
+    if os.environ.get("REG_RAG_PDF_CHILD") == "1" or not BUNDLED_PYTHON.exists():
+        raise ModuleNotFoundError("reportlab")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        input_path = tmp_path / "chunk.json"
+        output_path = tmp_path / "source.pdf"
+        input_path.write_text(json.dumps(chunk, ensure_ascii=False), encoding="utf-8")
+        script = """
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ["REG_RAG_PDF_CHILD"] = "1"
+import server
+
+chunk = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+Path(sys.argv[2]).write_bytes(server.make_source_pdf(chunk))
+"""
+        proc = subprocess.run(
+            [str(BUNDLED_PYTHON), "-c", script, str(input_path), str(output_path)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0 or not output_path.exists():
+            detail = (proc.stderr or proc.stdout or "PDF generator failed").strip()
+            raise RuntimeError(f"원본 PDF 생성 실패: {detail[:500]}")
+        return output_path.read_bytes()
+
+
+def make_source_pdf(chunk: dict[str, Any]) -> bytes:
+    try:
+        return make_source_pdf_reportlab(chunk)
+    except ImportError:
+        return make_source_pdf_with_bundled_python(chunk)
+
+
+def make_source_pdf_reportlab(chunk: dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    chunks = source_chunks(chunk)
+    source_path = Path(str(chunk.get("source_path") or "source"))
+    title = source_path.stem if source_path.name else str(chunk.get("doc_title") or "원본문서")
+    font_name = register_pdf_font()
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "SourceTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=16,
+        leading=22,
+        alignment=0,
+        textColor=colors.HexColor("#202321"),
+    )
+    meta_style = ParagraphStyle(
+        "SourceMeta",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=9,
+        leading=14,
+        textColor=colors.HexColor("#68726b"),
+    )
+    section_style = ParagraphStyle(
+        "SourceSection",
+        parent=styles["Heading3"],
+        fontName=font_name,
+        fontSize=11,
+        leading=16,
+        spaceBefore=8,
+        spaceAfter=4,
+        textColor=colors.HexColor("#202321"),
+    )
+    body_style = ParagraphStyle(
+        "SourceBody",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=9.5,
+        leading=15,
+        spaceAfter=7,
+    )
+    story = [
+        Paragraph(html.escape(unicodedata.normalize("NFC", title)), title_style),
+        Paragraph(
+            html.escape(unicodedata.normalize("NFC", f"원본 파일: {source_path.name or chunk.get('source_file', 'source')}")),
+            meta_style,
+        ),
+        Spacer(1, 8),
+    ]
+    for item in chunks:
+        section = str(item.get("section_title") or "본문")
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        story.append(Paragraph(html.escape(unicodedata.normalize("NFC", section)), section_style))
+        story.append(Paragraph(html.escape(unicodedata.normalize("NFC", text)).replace("\n", "<br/>"), body_style))
+    doc.build(story)
+    return buffer.getvalue()
 
 
 def make_result_pdf_reportlab(chunk: dict[str, Any]) -> bytes:
@@ -1220,6 +1364,14 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             source_download(self, chunk)
+            return
+        if path == "/api/download/source-pdf":
+            qs = parse_qs(parsed.query)
+            chunk = get_chunk_by_id((qs.get("id") or [""])[0])
+            if not chunk:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            source_pdf_download(self, chunk)
             return
         if path == "/api/download/result":
             qs = parse_qs(parsed.query)
