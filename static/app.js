@@ -4,6 +4,10 @@ const state = {
   lastHealth: null,
 };
 
+const params = new URLSearchParams(window.location.search);
+const apiBase = String(params.get("api") || window.REG_RAG_API_BASE || "").replace(/\/$/, "");
+const isPagesMode = window.location.hostname.endsWith("github.io") && !apiBase;
+
 const qs = (selector) => document.querySelector(selector);
 const qsa = (selector) => Array.from(document.querySelectorAll(selector));
 
@@ -15,7 +19,11 @@ function showToast(message) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  if (isPagesMode) {
+    throw new Error("GitHub Pages는 정적 프론트엔드입니다. 실제 검색은 백엔드 API URL을 ?api=로 연결하세요.");
+  }
+  const url = apiBase ? `${apiBase}${path}` : path;
+  const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
@@ -40,6 +48,12 @@ function escapeHtml(value) {
 }
 
 async function refreshHealth() {
+  if (isPagesMode) {
+    qs("#health-dot").className = "dot";
+    qs("#health-text").textContent = "라이브 페이지 배포됨 · 검색 서버 연결 필요";
+    qs("#chunk-count").textContent = "-";
+    return;
+  }
   try {
     const health = await api("/api/health");
     state.lastHealth = health;
@@ -244,6 +258,13 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
+  if (isPagesMode) {
+    renderDocuments();
+    await refreshHealth();
+    qs("#answer-output").textContent =
+      "GitHub Pages 라이브 프론트엔드입니다.\n실제 내부 규정 검색은 Python API 서버가 필요합니다.\n백엔드가 배포되면 URL 뒤에 ?api=https://YOUR_API_HOST 를 붙여 연결할 수 있습니다.";
+    return;
+  }
   await refreshDocuments();
   await runSearch();
 }

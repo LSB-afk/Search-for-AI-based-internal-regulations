@@ -72,10 +72,11 @@ docker run --rm -p 8765:8765 \
 
 ## GitHub 배포
 
-`main` 브랜치에 push하면 GitHub Actions가 두 가지를 수행합니다.
+`main` 브랜치에 push하면 GitHub Actions가 세 가지를 수행합니다.
 
 - `smoke`: 서버 문법 검사와 기본 API smoke test
 - `docker-publish`: GitHub Container Registry에 서버 이미지 배포
+- `pages`: GitHub Pages 정적 프론트엔드 배포
 
 이미지 주소:
 
@@ -84,6 +85,18 @@ ghcr.io/lsb-afk/search-for-ai-based-internal-regulations:latest
 ```
 
 GitHub에는 내부 문서를 올리지 않으므로, 실제 운영 서버에서는 위 Docker 실행 예시처럼 규정 폴더를 별도 볼륨으로 붙여야 합니다.
+
+정적 프론트엔드 URL:
+
+```bash
+https://lsb-afk.github.io/Search-for-AI-based-internal-regulations/
+```
+
+별도 HTTPS 백엔드 API를 연결할 때는 다음처럼 엽니다.
+
+```bash
+https://lsb-afk.github.io/Search-for-AI-based-internal-regulations/?api=https://YOUR_API_HOST
+```
 
 ## 현재 구현 범위
 

@@ -951,6 +951,9 @@ def send_bytes(
 ) -> None:
     encoded_name = quote(filename)
     handler.send_response(HTTPStatus.OK)
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(data)))
     handler.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded_name}")
@@ -1290,6 +1293,9 @@ def make_result_hwp_html(chunk: dict[str, Any]) -> bytes:
 def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -1327,6 +1333,13 @@ class RegRagHandler(BaseHTTPRequestHandler):
             return {}
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
