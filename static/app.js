@@ -4,9 +4,10 @@ const state = {
   lastHealth: null,
 };
 
+const isGitHubPages = window.location.hostname.endsWith("github.io");
 const params = new URLSearchParams(window.location.search);
-const apiBase = String(params.get("api") || window.REG_RAG_API_BASE || "").replace(/\/$/, "");
-const isPagesMode = window.location.hostname.endsWith("github.io") && !apiBase;
+const defaultApiBase = isGitHubPages ? "http://127.0.0.1:8765" : "";
+const apiBase = String(params.get("api") || window.REG_RAG_API_BASE || defaultApiBase).replace(/\/$/, "");
 
 const qs = (selector) => document.querySelector(selector);
 const qsa = (selector) => Array.from(document.querySelectorAll(selector));
@@ -19,9 +20,6 @@ function showToast(message) {
 }
 
 async function api(path, options = {}) {
-  if (isPagesMode) {
-    throw new Error("GitHub Pages는 정적 프론트엔드입니다. 실제 검색은 백엔드 API URL을 ?api=로 연결하세요.");
-  }
   const url = apiBase ? `${apiBase}${path}` : path;
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -32,6 +30,12 @@ async function api(path, options = {}) {
     throw new Error(payload.error || `HTTP ${response.status}`);
   }
   return payload;
+}
+
+function apiUrl(path) {
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  return apiBase ? `${apiBase}${path}` : path;
 }
 
 function permissionLabel(permission) {
@@ -48,12 +52,6 @@ function escapeHtml(value) {
 }
 
 async function refreshHealth() {
-  if (isPagesMode) {
-    qs("#health-dot").className = "dot";
-    qs("#health-text").textContent = "라이브 페이지 배포됨 · 검색 서버 연결 필요";
-    qs("#chunk-count").textContent = "-";
-    return;
-  }
   try {
     const health = await api("/api/health");
     state.lastHealth = health;
@@ -62,7 +60,9 @@ async function refreshHealth() {
     qs("#chunk-count").textContent = health.chunks;
   } catch (error) {
     qs("#health-dot").className = "dot error";
-    qs("#health-text").textContent = "서버 연결 실패";
+    qs("#health-text").textContent = isGitHubPages
+      ? "로컬 검색 서버 연결 실패 · 127.0.0.1:8765 확인 필요"
+      : "서버 연결 실패";
   }
 }
 
@@ -121,8 +121,8 @@ function renderResults(payload) {
     .map((item) => {
       const period = [item.effective_from || "시행일 미상", item.effective_to || ""].filter(Boolean).join(" ~ ");
       const page = item.page ? `p.${item.page}` : "page 없음";
-      const sourceHref = item.download && item.source_path ? item.download.source : "";
-      const sourcePdfHref = item.download && item.source_path ? item.download.source_pdf : "";
+      const sourceHref = item.download && item.source_path ? apiUrl(item.download.source) : "";
+      const sourcePdfHref = item.download && item.source_path ? apiUrl(item.download.source_pdf) : "";
       return `
         <article class="result-card">
           <div class="result-title">
@@ -258,13 +258,6 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  if (isPagesMode) {
-    renderDocuments();
-    await refreshHealth();
-    qs("#answer-output").textContent =
-      "GitHub Pages 라이브 프론트엔드입니다.\n실제 내부 규정 검색은 Python API 서버가 필요합니다.\n백엔드가 배포되면 URL 뒤에 ?api=https://YOUR_API_HOST 를 붙여 연결할 수 있습니다.";
-    return;
-  }
   await refreshDocuments();
   await runSearch();
 }
