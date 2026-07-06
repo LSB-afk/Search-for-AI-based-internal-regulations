@@ -240,10 +240,17 @@ async function refreshHealth() {
 }
 
 async function refreshDocuments() {
-  const payload = await api("/api/documents");
-  state.documents = payload.documents || [];
-  renderDocumentViews();
-  await refreshHealth();
+  try {
+    const payload = await api("/api/documents");
+    state.documents = payload.documents || [];
+    renderDocumentViews();
+    await refreshHealth();
+  } catch (error) {
+    state.documents = [];
+    renderDocumentViews();
+    await refreshHealth();
+    throw new Error(apiFailureMessage());
+  }
 }
 
 function renderDocumentViews() {
@@ -538,6 +545,7 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
+  renderDocumentViews();
   await refreshDocuments();
   await runSearch();
 }
