@@ -657,7 +657,9 @@ async function refreshOperations() {
     state.operationOffline = false;
   } catch (error) {
     state.operationOffline = true;
-    state.dashboard = state.dashboard || { offline: true, pending_count: 0, error_count: 0, last_scan: null };
+    state.dashboard = { offline: true, pending_count: 0, error_count: 0, last_scan: null };
+    state.versions = [];
+    state.events = [];
   }
   renderSyncRail();
   renderShell();
@@ -848,7 +850,6 @@ function renderResults(payload) {
             <div class="result-title">
               <div>
                 <strong>${escapeHtml(item.doc_title || "제한 문서")}</strong>
-                <span>${escapeHtml(item.section_title || "권한 제한")}</span>
               </div>
               <span class="lock-mark" aria-hidden="true">잠금</span>
             </div>

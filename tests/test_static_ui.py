@@ -140,6 +140,31 @@ class ProductShellStaticTest(unittest.TestCase):
         self.assertIn("상위 권한 필요", JS)
         self.assertIn("lock-mark", CSS)
         self.assertRegex(JS, r"if\s*\(\s*isRestrictedResult\(item\)\s*\)")
+        restricted_branch = re.search(
+            r"if\s*\(\s*isRestrictedResult\(item\)\s*\)\s*\{(?P<branch>.*?)\n\s*\}\n\s*return\s*`",
+            JS,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(restricted_branch)
+        restricted_markup = restricted_branch.group("branch")
+        self.assertIn('item.doc_title || "제한 문서"', restricted_markup)
+        self.assertNotIn("item.section_title", restricted_markup)
+        self.assertNotIn("item.summary", restricted_markup)
+        self.assertNotIn("item.snippet", restricted_markup)
+        self.assertNotIn("item.text", restricted_markup)
+        self.assertNotIn("item.download", restricted_markup)
+        self.assertNotIn("download-button", restricted_markup)
+
+    def test_operations_refresh_clears_stale_versions_and_events_on_failure(self):
+        catch_branch = re.search(
+            r"async function refreshOperations\(\).*?catch\s*\(error\)\s*\{(?P<branch>.*?)\n\s*\}\n\s*renderSyncRail\(\);",
+            JS,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(catch_branch)
+        failure_handling = catch_branch.group("branch")
+        self.assertRegex(failure_handling, r"state\.versions\s*=\s*\[\]")
+        self.assertRegex(failure_handling, r"state\.events\s*=\s*\[\]")
 
     def test_timeline_status_copy_hashes_and_empty_states_are_present(self):
         for copy in ("현재본", "시행 예정", "이전 버전", "반려", "오류", "검토 대기"):
