@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from hashlib import sha256
 from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -407,9 +408,132 @@ class ApiRoutesTest(IsolatedServerTest):
         event = self.registry.events(1)[0]
         self.assertEqual(event["event_type"], "SourceDownloadFailed")
         self.assertEqual(event["metadata"]["outcome"], "chunk_not_found")
-        self.assertEqual(event["metadata"]["requested_id"], "missing-chunk")
+        self.assertEqual(event["metadata"]["requested_id_length"], len("missing-chunk"))
+        self.assertEqual(event["metadata"]["requested_id_sha256"], sha256(b"missing-chunk").hexdigest())
+        self.assertEqual(event["metadata"]["requested_id_format_valid"], False)
+        self.assertNotIn("missing-chunk", json.dumps(event, ensure_ascii=False))
+        self.assertNotIn("requested_id\"", json.dumps(event, ensure_ascii=False))
         self.assertIsNone(event["metadata"]["source_file"])
         self.assertIsNone(event["metadata"]["version_id"])
+
+    def test_source_download_unknown_malicious_id_records_only_safe_diagnostics(self):
+        malicious_id = "../../secret?body=private&summary=leak"
+        self.write_chunks([])
+
+        with self.assertRaises(HTTPError):
+            urlopen(f"{self.base_url}/api/download/source?{urlencode({'id': malicious_id})}", timeout=5)
+
+        event = self.registry.events(1)[0]
+        event_json = json.dumps(event, ensure_ascii=False)
+        self.assertEqual(event["event_type"], "SourceDownloadFailed")
+        self.assertEqual(event["metadata"]["outcome"], "chunk_not_found")
+        self.assertEqual(event["metadata"]["requested_id_length"], len(malicious_id))
+        self.assertEqual(event["metadata"]["requested_id_sha256"], sha256(malicious_id.encode("utf-8")).hexdigest())
+        self.assertEqual(event["metadata"]["requested_id_format_valid"], False)
+        self.assertNotIn(malicious_id, event_json)
+        self.assertNotIn("../../secret", event_json)
+        self.assertNotIn("private", event_json)
+        self.assertNotIn("summary=leak", event_json)
+        self.assertNotIn("requested_id\"", event_json)
+
+    def test_source_download_read_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
+        source.write_bytes(b"private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문",
+            source_file=source.name,
+            source_type="hwp",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-read-failed"
+        self.write_chunks([chunk])
+
+        with mock.patch.object(Path, "read_bytes", side_effect=OSError("cannot read")):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(f"{self.base_url}/api/download/source?id={chunk['id']}", timeout=5)
+
+        self.assertEqual(context.exception.code, 404)
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        self.assertEqual(events[0]["metadata"]["outcome"], "read_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-read-failed")
+
+    def test_source_pdf_existing_pdf_read_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.pdf"
+        source.write_bytes(b"%PDF private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문",
+            source_file=source.name,
+            source_type="pdf",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-pdf-read-failed"
+        self.write_chunks([chunk])
+
+        with mock.patch.object(Path, "read_bytes", side_effect=OSError("cannot read")):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(f"{self.base_url}/api/download/source-pdf?id={chunk['id']}", timeout=5)
+
+        self.assertEqual(context.exception.code, 404)
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        self.assertEqual(events[0]["metadata"]["outcome"], "read_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-pdf-read-failed")
+
+    def test_source_pdf_conversion_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
+        source.write_bytes(b"private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문",
+            source_file=source.name,
+            source_type="hwp",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-conversion-failed"
+        self.write_chunks([chunk])
+
+        with mock.patch.object(server, "make_source_pdf", side_effect=RuntimeError("cannot convert")):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(f"{self.base_url}/api/download/source-pdf?id={chunk['id']}", timeout=5)
+
+        self.assertEqual(context.exception.code, 500)
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        self.assertEqual(events[0]["metadata"]["outcome"], "conversion_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-conversion-failed")
+
+    def test_source_pdf_existing_pdf_success_records_success_after_reading_bytes(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.pdf"
+        source.write_bytes(b"%PDF private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문은 감사 이벤트에 남기지 않는다",
+            source_file=source.name,
+            source_type="pdf",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-pdf-success"
+        self.write_chunks([chunk])
+
+        with urlopen(f"{self.base_url}/api/download/source-pdf?id={chunk['id']}", timeout=5) as response:
+            body = response.read()
+
+        self.assertEqual(body, b"%PDF private source bytes")
+        event = self.registry.events(1)[0]
+        event_json = json.dumps(event, ensure_ascii=False)
+        self.assertEqual(event["event_type"], "SourceDownloaded")
+        self.assertEqual(event["metadata"]["source_file"], source.name)
+        self.assertEqual(event["metadata"]["version_id"], "version-pdf-success")
+        self.assertEqual(event["metadata"]["outcome"], "success")
+        self.assertNotIn("문서 본문", event_json)
+        self.assertNotIn("%PDF private source bytes", event_json)
 
     def test_post_routes_reject_valid_non_object_json_bodies(self):
         array_status, array_body = self.post_raw_json("/api/search", "[]")

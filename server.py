@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import hashlib
 import html
 import json
 import math
@@ -1059,6 +1060,7 @@ def record_source_download_event(chunk: dict[str, Any], event_type: str, outcome
 
 
 def record_missing_source_download_event(requested_id: str) -> None:
+    requested_id_bytes = requested_id.encode("utf-8", errors="replace")
     REGISTRY.record_event(
         "SourceDownloadFailed",
         summary="규정 원본 다운로드 요청 처리",
@@ -1066,7 +1068,9 @@ def record_missing_source_download_event(requested_id: str) -> None:
             "source_file": None,
             "version_id": None,
             "outcome": "chunk_not_found",
-            "requested_id": requested_id,
+            "requested_id_length": len(requested_id),
+            "requested_id_sha256": hashlib.sha256(requested_id_bytes).hexdigest(),
+            "requested_id_format_valid": bool(re.fullmatch(r"[0-9a-f]{12}", requested_id)),
         },
     )
 
@@ -1083,8 +1087,14 @@ def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> N
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        record_source_download_event(chunk, "SourceDownloadFailed", "read_failed")
+        handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+        return
+    send_bytes(handler, data, filename=path.name, content_type=content_type)
     record_source_download_event(chunk, "SourceDownloaded", "success")
-    send_bytes(handler, path.read_bytes(), filename=path.name, content_type=content_type)
 
 
 def source_chunks(chunk: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1111,17 +1121,24 @@ def source_pdf_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) 
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     if path.suffix.lower() == ".pdf":
+        try:
+            data = path.read_bytes()
+        except OSError:
+            record_source_download_event(chunk, "SourceDownloadFailed", "read_failed")
+            handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
+            return
+        send_bytes(handler, data, filename=path.name, content_type="application/pdf")
         record_source_download_event(chunk, "SourceDownloaded", "success")
-        send_bytes(handler, path.read_bytes(), filename=path.name, content_type="application/pdf")
         return
     filename = safe_download_name(f"{path.stem}_원본", ".pdf")
     try:
         data = make_source_pdf(chunk)
     except Exception:
         record_source_download_event(chunk, "SourceDownloadFailed", "conversion_failed")
-        raise
-    record_source_download_event(chunk, "SourceDownloaded", "success")
+        handler.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "source file could not be converted")
+        return
     send_bytes(handler, data, filename=filename, content_type="application/pdf")
+    record_source_download_event(chunk, "SourceDownloaded", "success")
 
 
 def result_payload(chunk: dict[str, Any]) -> dict[str, str]:
