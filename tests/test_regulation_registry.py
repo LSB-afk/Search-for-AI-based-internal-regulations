@@ -53,6 +53,34 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual(self.registry.versions(as_of="2026-07-12", include_history=False), [])
         self.assertEqual(len(self.registry.versions(as_of="2027-01-01", include_history=False)), 1)
 
+    def test_scheduled_replacement_does_not_hide_current_version_before_effective_date(self):
+        current = self.registry.record_detection(
+            canonical_title="복무규정",
+            source_path="/closed/복무규정_2026.01.01.hwp",
+            content_hash="current-hash",
+            effective_from="2026-01-01",
+            chunk_ids=["current-1"],
+        )
+        self.registry.approve_version(current["version_id"], "감사팀장", "2026-01-01", today="2026-07-12")
+        replacement = self.registry.record_detection(
+            canonical_title="복무규정",
+            source_path="/closed/복무규정_2027.01.01.hwp",
+            content_hash="replacement-hash",
+            effective_from="2027-01-01",
+            chunk_ids=["replacement-1"],
+        )
+        self.registry.approve_version(
+            replacement["version_id"], "감사팀장", "2027-01-01", today="2026-07-12"
+        )
+
+        before_effective = self.registry.versions(as_of="2026-12-31", include_history=False)
+        on_effective = self.registry.versions(as_of="2027-01-01", include_history=False)
+        after_effective = self.registry.versions(as_of="2027-02-01", include_history=False)
+
+        self.assertEqual([item["version_id"] for item in before_effective], [current["version_id"]])
+        self.assertEqual([item["version_id"] for item in on_effective], [replacement["version_id"]])
+        self.assertEqual([item["version_id"] for item in after_effective], [replacement["version_id"]])
+
     def test_duplicate_hash_reuses_detected_version(self):
         first = self.registry.record_detection("회계규정", "/closed/a.hwp", "same", "2026-05-27", ["a"])
         second = self.registry.record_detection("회계규정", "/closed/b.hwp", "same", "2026-05-27", ["b"])

@@ -132,7 +132,7 @@ class RegulationRegistry:
         as_of_day = _parse_iso_date(as_of or _today_iso())
         current = []
         for version in self._sorted_versions():
-            if version["status"] not in {"approved", "scheduled"}:
+            if version["status"] not in {"approved", "scheduled", "superseded"}:
                 continue
             effective_from = _parse_iso_date(version["effective_from"])
             effective_to = version.get("effective_to")
