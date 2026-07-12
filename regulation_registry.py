@@ -162,6 +162,25 @@ class RegulationRegistry:
     def events(self, limit: int = 100) -> list[dict[str, Any]]:
         return copy.deepcopy(self.state["events"][-limit:])
 
+    def record_event(
+        self,
+        event_type: str,
+        *,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        version_id: str | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "event_type": event_type,
+            "version_id": version_id,
+            "summary": summary,
+            "metadata": copy.deepcopy(metadata or {}),
+        }
+        self.state["events"].append(event)
+        self._persist()
+        return copy.deepcopy(event)
+
     def scan_sources(self, paths, ingest, effective_date=None) -> dict[str, Any]:
         result: dict[str, Any] = {
             "new_count": 0,

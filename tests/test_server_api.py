@@ -24,6 +24,7 @@ class IsolatedServerTest(unittest.TestCase):
             mock.patch.object(server, "DATA_DIR", self.data_dir),
             mock.patch.object(server, "INDEX_FILE", self.index_file),
             mock.patch.object(server, "REGISTRY", self.registry),
+            mock.patch.object(server, "configured_source_roots", lambda: [Path(self.tmp.name).resolve()]),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -39,6 +40,16 @@ class IsolatedServerTest(unittest.TestCase):
 
 
 class SearchVersionFilterTest(IsolatedServerTest):
+    def test_search_audit_event_does_not_store_full_query(self):
+        query = "개인정보가 포함될 수 있는 긴 질의"
+
+        event = server.search_audit_payload(query, "employee", "2026-07-12", 3)
+
+        self.assertNotIn(query, event["summary"])
+        self.assertNotIn(query, json.dumps(event["metadata"], ensure_ascii=False))
+        self.assertEqual(event["metadata"]["query_length"], 19)
+        self.assertEqual(event["metadata"]["result_count"], 3)
+
     def test_search_uses_only_version_ids_allowed_by_registry(self):
         chunks = [
             server.make_chunk(
@@ -191,6 +202,8 @@ class SearchVersionFilterTest(IsolatedServerTest):
 class ApiRoutesTest(IsolatedServerTest):
     def setUp(self):
         super().setUp()
+        self.log_patcher = mock.patch.object(server.RegRagHandler, "log_message", lambda *args: None)
+        self.log_patcher.start()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.RegRagHandler)
         self.thread = Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -200,6 +213,7 @@ class ApiRoutesTest(IsolatedServerTest):
         self.httpd.shutdown()
         self.thread.join(timeout=2)
         self.httpd.server_close()
+        self.log_patcher.stop()
         super().tearDown()
 
     def get_json(self, path, query=None):
@@ -304,6 +318,98 @@ class ApiRoutesTest(IsolatedServerTest):
 
         self.assertEqual(status, 400)
         self.assertIn("as_of", body["error"])
+
+    def test_successful_search_records_private_audit_event(self):
+        chunks = [
+            server.make_chunk(
+                doc_title="인사규정",
+                section_title="본문",
+                text="개인정보 감사 기준",
+                effective_from="2026-01-01",
+            )
+        ]
+        self.write_chunks(chunks)
+
+        status, body = self.post_json(
+            "/api/search",
+            {"query": "개인정보가 포함될 수 있는 긴 질의", "role": "audit", "as_of": "2026-07-12"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("results", body)
+        event = self.registry.events(1)[0]
+        event_json = json.dumps(event, ensure_ascii=False)
+        self.assertEqual(event["event_type"], "SearchExecuted")
+        self.assertNotIn("개인정보가 포함될 수 있는 긴 질의", event_json)
+        self.assertEqual(event["metadata"]["query_length"], 19)
+        self.assertEqual(event["metadata"]["role"], "audit")
+        self.assertEqual(event["metadata"]["as_of"], "2026-07-12")
+        self.assertEqual(event["metadata"]["result_count"], len(body["results"]))
+
+    def test_source_download_records_success_without_document_content(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
+        source.write_bytes(b"private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문은 감사 이벤트에 남기지 않는다",
+            source_file=source.name,
+            source_type="hwp",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-success"
+        self.write_chunks([chunk])
+
+        with urlopen(f"{self.base_url}/api/download/source?id={chunk['id']}", timeout=5) as response:
+            body = response.read()
+
+        self.assertEqual(body, b"private source bytes")
+        event = self.registry.events(1)[0]
+        event_json = json.dumps(event, ensure_ascii=False)
+        self.assertEqual(event["event_type"], "SourceDownloaded")
+        self.assertEqual(event["metadata"]["source_file"], source.name)
+        self.assertEqual(event["metadata"]["version_id"], "version-success")
+        self.assertEqual(event["metadata"]["outcome"], "success")
+        self.assertNotIn("문서 본문", event_json)
+        self.assertNotIn("private source bytes", event_json)
+
+    def test_source_download_records_failure_without_document_content(self):
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="실패 이벤트에도 본문은 남기지 않는다",
+            source_file="missing.hwp",
+            source_type="hwp",
+            source_path=str(Path(self.tmp.name) / "missing.hwp"),
+        )
+        chunk["version_id"] = "version-failed"
+        self.write_chunks([chunk])
+
+        with self.assertRaises(HTTPError) as context:
+            urlopen(f"{self.base_url}/api/download/source?id={chunk['id']}", timeout=5)
+
+        self.assertEqual(context.exception.code, 404)
+        event = self.registry.events(1)[0]
+        event_json = json.dumps(event, ensure_ascii=False)
+        self.assertEqual(event["event_type"], "SourceDownloadFailed")
+        self.assertEqual(event["metadata"]["source_file"], "missing.hwp")
+        self.assertEqual(event["metadata"]["version_id"], "version-failed")
+        self.assertEqual(event["metadata"]["outcome"], "not_found")
+        self.assertNotIn("실패 이벤트", event_json)
+
+    def test_source_download_records_failure_for_unknown_chunk_id(self):
+        self.write_chunks([])
+
+        with self.assertRaises(HTTPError) as context:
+            urlopen(f"{self.base_url}/api/download/source?id=missing-chunk", timeout=5)
+
+        self.assertEqual(context.exception.code, 404)
+        event = self.registry.events(1)[0]
+        self.assertEqual(event["event_type"], "SourceDownloadFailed")
+        self.assertEqual(event["metadata"]["outcome"], "chunk_not_found")
+        self.assertEqual(event["metadata"]["requested_id"], "missing-chunk")
+        self.assertIsNone(event["metadata"]["source_file"])
+        self.assertIsNone(event["metadata"]["version_id"])
 
     def test_post_routes_reject_valid_non_object_json_bodies(self):
         array_status, array_body = self.post_raw_json("/api/search", "[]")

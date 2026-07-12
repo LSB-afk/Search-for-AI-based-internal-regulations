@@ -627,6 +627,18 @@ def search_index(
     )
 
 
+def search_audit_payload(query: str, role: str, as_of: str | None, result_count: int) -> dict[str, Any]:
+    return {
+        "summary": f"{ROLE_LABEL.get(role, role)} 권한으로 규정 검색 실행",
+        "metadata": {
+            "query_length": len(query),
+            "role": role,
+            "as_of": as_of,
+            "result_count": result_count,
+        },
+    }
+
+
 def generate_answer(
     query: str,
     results: list[dict[str, Any]],
@@ -1025,16 +1037,53 @@ def send_bytes(
     handler.wfile.write(data)
 
 
+def source_download_audit_payload(chunk: dict[str, Any], outcome: str) -> dict[str, Any]:
+    return {
+        "summary": "규정 원본 다운로드 요청 처리",
+        "metadata": {
+            "source_file": chunk.get("source_file"),
+            "version_id": chunk.get("version_id"),
+            "outcome": outcome,
+        },
+    }
+
+
+def record_source_download_event(chunk: dict[str, Any], event_type: str, outcome: str) -> None:
+    payload = source_download_audit_payload(chunk, outcome)
+    REGISTRY.record_event(
+        event_type,
+        summary=payload["summary"],
+        metadata=payload["metadata"],
+        version_id=chunk.get("version_id"),
+    )
+
+
+def record_missing_source_download_event(requested_id: str) -> None:
+    REGISTRY.record_event(
+        "SourceDownloadFailed",
+        summary="규정 원본 다운로드 요청 처리",
+        metadata={
+            "source_file": None,
+            "version_id": None,
+            "outcome": "chunk_not_found",
+            "requested_id": requested_id,
+        },
+    )
+
+
 def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> None:
     source_path = chunk.get("source_path")
     if not source_path:
+        record_source_download_event(chunk, "SourceDownloadFailed", "not_available")
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     path = Path(source_path)
     if not path.exists() or not path.is_file() or not is_safe_source(path):
+        record_source_download_event(chunk, "SourceDownloadFailed", "not_found")
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    record_source_download_event(chunk, "SourceDownloaded", "success")
     send_bytes(handler, path.read_bytes(), filename=path.name, content_type=content_type)
 
 
@@ -1053,17 +1102,26 @@ def source_chunks(chunk: dict[str, Any]) -> list[dict[str, Any]]:
 def source_pdf_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> None:
     source_path = chunk.get("source_path")
     if not source_path:
+        record_source_download_event(chunk, "SourceDownloadFailed", "not_available")
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     path = Path(source_path)
     if not path.exists() or not path.is_file() or not is_safe_source(path):
+        record_source_download_event(chunk, "SourceDownloadFailed", "not_found")
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
     if path.suffix.lower() == ".pdf":
+        record_source_download_event(chunk, "SourceDownloaded", "success")
         send_bytes(handler, path.read_bytes(), filename=path.name, content_type="application/pdf")
         return
     filename = safe_download_name(f"{path.stem}_원본", ".pdf")
-    send_bytes(handler, make_source_pdf(chunk), filename=filename, content_type="application/pdf")
+    try:
+        data = make_source_pdf(chunk)
+    except Exception:
+        record_source_download_event(chunk, "SourceDownloadFailed", "conversion_failed")
+        raise
+    record_source_download_event(chunk, "SourceDownloaded", "success")
+    send_bytes(handler, data, filename=filename, content_type="application/pdf")
 
 
 def result_payload(chunk: dict[str, Any]) -> dict[str, str]:
@@ -1508,16 +1566,20 @@ class RegRagHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/download/source":
             qs = parse_qs(parsed.query)
-            chunk = get_chunk_by_id((qs.get("id") or [""])[0])
+            chunk_id_value = (qs.get("id") or [""])[0]
+            chunk = get_chunk_by_id(chunk_id_value)
             if not chunk:
+                record_missing_source_download_event(chunk_id_value)
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             source_download(self, chunk)
             return
         if path == "/api/download/source-pdf":
             qs = parse_qs(parsed.query)
-            chunk = get_chunk_by_id((qs.get("id") or [""])[0])
+            chunk_id_value = (qs.get("id") or [""])[0]
+            chunk = get_chunk_by_id(chunk_id_value)
             if not chunk:
+                record_missing_source_download_event(chunk_id_value)
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             source_pdf_download(self, chunk)
@@ -1564,6 +1626,13 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     limit=int(body.get("limit", 6)),
                     include_history=bool(body.get("include_history", False)),
                 )
+                payload = search_audit_payload(
+                    str(body.get("query", "")),
+                    result["role"],
+                    result["as_of"],
+                    len(result["results"]),
+                )
+                REGISTRY.record_event("SearchExecuted", summary=payload["summary"], metadata=payload["metadata"])
                 json_response(self, HTTPStatus.OK, result)
                 return
             if path == "/api/versions/approve":
