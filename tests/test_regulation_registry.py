@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from regulation_registry import RegulationRegistry
 
@@ -213,6 +214,96 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual(first["error_count"], 1)
         self.assertEqual(second["new_count"], 1)
         self.assertEqual(attempts, 2)
+
+    def test_scan_isolates_effective_date_failures_and_continues(self):
+        bad = Path(self.tmp.name) / "회계규정_2026.05.27.hwp"
+        good = Path(self.tmp.name) / "복무규정_2026.05.27.hwp"
+        bad.write_bytes(b"bad")
+        good.write_bytes(b"good")
+
+        def effective_date(path):
+            if path == bad:
+                raise RuntimeError("broken date extractor")
+            return "2026-05-27"
+
+        result = self.registry.scan_sources(
+            [bad, good],
+            lambda path: [{"id": f"{path.stem}-chunk", "text": path.stem}],
+            effective_date=effective_date,
+        )
+
+        self.assertEqual(result["new_count"], 1)
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(result["errors"][0]["source_path"], str(bad.resolve()))
+        self.assertEqual(result["errors"][0]["error"], "broken date extractor")
+        scan_statuses = [source["status"] for source in self.registry.state["scan_runs"][-1]["sources"]]
+        self.assertEqual(scan_statuses, ["error", "new"])
+        self.assertEqual(
+            [event["event_type"] for event in self.registry.events()],
+            ["RegulationVersionScanFailed", "detected"],
+        )
+
+    def test_dictionary_chunks_retry_until_indexed_acknowledged(self):
+        source = Path(self.tmp.name) / "감사규정_2026.05.27.pdf"
+        source.write_bytes(b"same-content")
+
+        def ingest(path):
+            return [{"id": "chunk-1", "text": "감사 자료"}]
+
+        first = self.registry.scan_sources([source], ingest, effective_date=lambda path: "2026-05-27")
+        version_id = first["chunks"][0]["version_id"]
+        second = self.registry.scan_sources([source], ingest, effective_date=lambda path: "2026-05-27")
+        self.registry.mark_versions_indexed([version_id])
+        third = self.registry.scan_sources([source], ingest, effective_date=lambda path: "2026-05-27")
+
+        self.assertEqual(first["new_count"], 1)
+        self.assertEqual(second["unchanged_count"], 0)
+        self.assertEqual(len(second["chunks"]), 1)
+        self.assertEqual(second["chunks"][0]["version_id"], version_id)
+        self.assertEqual(third["unchanged_count"], 1)
+        self.assertEqual(third["chunks"], [])
+
+    def test_local_ingest_marks_versions_indexed_only_after_add_chunks_succeeds(self):
+        import server
+
+        source = Path(self.tmp.name) / "감사규정_2026.05.27.pdf"
+        source.write_bytes(b"same-content")
+        registry = RegulationRegistry(Path(self.tmp.name) / "server-registry.json")
+        calls = []
+
+        def ingest_file(path):
+            return [{"id": "chunk-1", "text": "감사 자료"}]
+
+        def failing_add_chunks(chunks):
+            calls.append([chunk["version_id"] for chunk in chunks])
+            raise RuntimeError("index write failed")
+
+        with mock.patch.object(server, "REGISTRY", registry), mock.patch.object(
+            server, "local_sources", return_value=[source]
+        ), mock.patch.object(server, "ingest_file", side_effect=ingest_file), mock.patch.object(
+            server, "add_chunks", side_effect=failing_add_chunks
+        ), mock.patch.object(
+            server, "document_summary", return_value=[]
+        ):
+            with self.assertRaises(RuntimeError):
+                server.ingest_local_sources()
+
+        failed_version_id = calls[0][0]
+        self.assertFalse(registry.state["versions"][failed_version_id].get("indexed"))
+
+        with mock.patch.object(server, "REGISTRY", registry), mock.patch.object(
+            server, "local_sources", return_value=[source]
+        ), mock.patch.object(server, "ingest_file", side_effect=ingest_file), mock.patch.object(
+            server, "add_chunks", return_value=1
+        ) as add_chunks, mock.patch.object(
+            server, "document_summary", return_value=[]
+        ):
+            result = server.ingest_local_sources()
+
+        indexed_version_id = add_chunks.call_args.args[0][0]["version_id"]
+        self.assertEqual(indexed_version_id, failed_version_id)
+        self.assertTrue(registry.state["versions"][failed_version_id]["indexed"])
+        self.assertEqual(result["unchanged_count"], 0)
 
 
 if __name__ == "__main__":

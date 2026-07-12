@@ -129,6 +129,14 @@ class RegulationRegistry:
         self._persist()
         return copy.deepcopy(version)
 
+    def mark_versions_indexed(self, version_ids: list[str]) -> None:
+        for version_id in version_ids:
+            version = self._version_or_raise(version_id)
+            version["indexed"] = True
+            version["indexed_at"] = datetime.now(timezone.utc).isoformat()
+            self._append_event("RegulationVersionIndexed", version_id, {"version_id": version_id})
+        self._persist()
+
     def versions(self, as_of: str | None = None, include_history: bool = False) -> list[dict[str, Any]]:
         if include_history:
             return [copy.deepcopy(version) for version in self._sorted_versions()]
@@ -170,59 +178,59 @@ class RegulationRegistry:
         }
 
         for path in paths:
-            source_path = Path(path)
-            resolved_source = str(source_path.resolve())
-            title = _normalize_title(source_path.name)
-            content_hash = sha256_file(source_path)
-            previous = self._latest_version_for_title(title)
-            if previous is not None and previous["content_hash"] == content_hash:
-                result["unchanged_count"] += 1
-                scan_run["sources"].append(
-                    {"source_path": resolved_source, "status": "unchanged", "version_id": previous["version_id"]}
-                )
-                continue
-
-            change_type = "new" if previous is None else "changed"
             try:
+                source_path = Path(path)
+                resolved_source = str(source_path.resolve())
+                title = _normalize_title(source_path.name)
+                content_hash = sha256_file(source_path)
+                previous = self._latest_version_for_title(title)
+                if previous is not None and previous["content_hash"] == content_hash:
+                    if self._version_needs_index_retry(previous):
+                        chunks, chunk_ids = self._chunks_for_source(source_path, ingest)
+                        previous["chunk_ids"] = chunk_ids
+                        for chunk in chunks:
+                            self._inject_version_metadata(chunk, previous)
+                        result["chunks"].extend(chunks)
+                        scan_run["sources"].append(
+                            {
+                                "source_path": resolved_source,
+                                "status": "index_retry",
+                                "version_id": previous["version_id"],
+                            }
+                        )
+                        continue
+                    result["unchanged_count"] += 1
+                    scan_run["sources"].append(
+                        {"source_path": resolved_source, "status": "unchanged", "version_id": previous["version_id"]}
+                    )
+                    continue
+
+                change_type = "new" if previous is None else "changed"
                 ingest_result = ingest(source_path)
-            except Exception as exc:
+                chunks, chunk_ids = self._index_chunks_for_ingest_result(ingest_result)
                 version = self._record_scanned_version(
                     title,
                     resolved_source,
                     content_hash,
                     self._effective_date_for(source_path, effective_date),
-                    [],
-                    "scan_error",
-                    "scan_error",
-                    {"error": str(exc)},
-                    append_detected_event=False,
+                    chunk_ids,
+                    "pending",
+                    change_type,
+                    {"indexed": not chunks, "index_required": bool(chunks)},
                 )
-                error = {"source_path": resolved_source, "error": str(exc), "version_id": version["version_id"]}
+                for chunk in chunks:
+                    self._inject_version_metadata(chunk, version)
+                result["chunks"].extend(chunks)
+                result[f"{change_type}_count"] += 1
+                scan_run["sources"].append(
+                    {"source_path": resolved_source, "status": change_type, "version_id": version["version_id"]}
+                )
+            except Exception as exc:
+                error = self._record_scan_error(path, exc)
                 result["error_count"] += 1
                 result["errors"].append(error)
-                scan_run["sources"].append({"source_path": resolved_source, "status": "error", **error})
-                self._append_event("RegulationVersionScanFailed", version["version_id"], error)
+                scan_run["sources"].append({"status": "error", **error})
                 continue
-
-            chunks, chunk_ids = self._index_chunks_for_ingest_result(ingest_result)
-            version = self._record_scanned_version(
-                title,
-                resolved_source,
-                content_hash,
-                self._effective_date_for(source_path, effective_date),
-                chunk_ids,
-                "pending",
-                change_type,
-            )
-            for chunk in chunks:
-                chunk["regulation_id"] = version["regulation_id"]
-                chunk["version_id"] = version["version_id"]
-                chunk["version_status"] = version["status"]
-            result["chunks"].extend(chunks)
-            result[f"{change_type}_count"] += 1
-            scan_run["sources"].append(
-                {"source_path": resolved_source, "status": change_type, "version_id": version["version_id"]}
-            )
 
         for key in ("new_count", "changed_count", "unchanged_count", "error_count"):
             scan_run[key] = result[key]
@@ -300,6 +308,9 @@ class RegulationRegistry:
         value = effective_date(path)
         return value or date_from_path(path)
 
+    def _chunks_for_source(self, source_path: Path, ingest) -> tuple[list[dict[str, Any]], list[str]]:
+        return self._index_chunks_for_ingest_result(ingest(source_path))
+
     def _index_chunks_for_ingest_result(self, ingest_result) -> tuple[list[dict[str, Any]], list[str]]:
         chunks: list[dict[str, Any]] = []
         chunk_ids: list[str] = []
@@ -315,6 +326,48 @@ class RegulationRegistry:
             else:
                 raise TypeError(f"unsupported ingest result item: {type(item).__name__}")
         return chunks, chunk_ids
+
+    def _inject_version_metadata(self, chunk: dict[str, Any], version: dict[str, Any]) -> None:
+        chunk["regulation_id"] = version["regulation_id"]
+        chunk["version_id"] = version["version_id"]
+        chunk["version_status"] = version["status"]
+
+    def _version_needs_index_retry(self, version: dict[str, Any]) -> bool:
+        return bool(version.get("index_required")) and not bool(version.get("indexed"))
+
+    def _record_scan_error(self, path, exc: Exception) -> dict[str, Any]:
+        source_path = Path(path)
+        try:
+            resolved_source = str(source_path.resolve())
+        except Exception:
+            resolved_source = str(source_path)
+        try:
+            title = _normalize_title(source_path.name)
+        except Exception:
+            title = source_path.name
+        try:
+            content_hash = sha256_file(source_path)
+        except Exception:
+            content_hash = f"scan-error:{uuid.uuid4().hex}"
+        version = self._record_scanned_version(
+            title,
+            resolved_source,
+            content_hash,
+            date_from_path(source_path),
+            [],
+            "scan_error",
+            "scan_error",
+            {"error": str(exc), "retryable": True},
+            append_detected_event=False,
+        )
+        error = {
+            "source_path": resolved_source,
+            "error": str(exc),
+            "version_id": version["version_id"],
+            "retryable": True,
+        }
+        self._append_event("RegulationVersionScanFailed", version["version_id"], error)
+        return error
 
     def _find_duplicate(self, canonical_title: str, content_hash: str) -> dict[str, Any] | None:
         for version in self.state["versions"].values():

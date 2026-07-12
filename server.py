@@ -906,7 +906,9 @@ def ingest_local_sources() -> dict[str, Any]:
         effective_date=lambda path: date_from_text(path.name),
     )
     if result["chunks"]:
-        add_chunks(result.pop("chunks"))
+        chunks = result.pop("chunks")
+        add_chunks(chunks)
+        REGISTRY.mark_versions_indexed(sorted({chunk["version_id"] for chunk in chunks if chunk.get("version_id")}))
     result["documents"] = document_summary()
     return result
 
