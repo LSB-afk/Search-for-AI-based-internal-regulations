@@ -1,9 +1,44 @@
 const state = {
+  activeView: "search",
+  actorRole: "employee",
   role: "employee",
   documents: [],
+  dashboard: null,
+  localEvents: [],
   lastHealth: null,
   activeCategory: "all",
   documentFilter: "",
+};
+
+const ROLE_VIEWS = {
+  audit_lead: ["search", "latest", "updates", "history", "library", "permissions", "operations"],
+  auditor: ["search", "latest", "updates", "history", "library", "operations"],
+  department_head: ["search", "latest", "history", "library"],
+  employee: ["search", "latest", "library"],
+};
+
+const VIEW_LABELS = {
+  search: "통합 검색",
+  latest: "최신 규정",
+  updates: "업데이트 센터",
+  history: "개정 이력",
+  library: "규정 문서함",
+  permissions: "권한 관리",
+  operations: "운영 현황",
+};
+
+const ACTOR_API_ROLES = {
+  audit_lead: "admin",
+  auditor: "audit",
+  department_head: "employee",
+  employee: "employee",
+};
+
+const ACTOR_LABELS = {
+  audit_lead: "감사팀장",
+  auditor: "감사담당자",
+  department_head: "부서장",
+  employee: "일반직원",
 };
 
 const REGULATION_TYPES = new Set(["hwp", "hwpx", "pdf"]);
@@ -215,6 +250,28 @@ function latestEffectiveFrom(docs) {
   return dates.length ? dates[dates.length - 1] : "시행일 미상";
 }
 
+function formatScanTime(scan) {
+  const value = scan && (scan.finished_at || scan.started_at);
+  if (!value) return "스캔 기록 없음";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function roleViews() {
+  return ROLE_VIEWS[state.actorRole] || ROLE_VIEWS.employee;
+}
+
+function setActiveView(viewId) {
+  state.activeView = roleViews().includes(viewId) ? viewId : "search";
+  renderActiveView();
+}
+
 function permissionSummary(docs) {
   const permissions = new Set(docs.flatMap((doc) => doc.permissions || []));
   if (!permissions.size) return "권한 없음";
@@ -224,6 +281,105 @@ function permissionSummary(docs) {
     .join(", ");
 }
 
+function renderShell() {
+  const actorSelect = qs("#actor-role");
+  if (actorSelect && actorSelect.value !== state.actorRole) {
+    actorSelect.value = state.actorRole;
+  }
+  const nav = qs("#primary-nav");
+  nav.innerHTML = roleViews()
+    .map((viewId) => {
+      const isActive = viewId === state.activeView;
+      return `
+        <button class="nav-tab${isActive ? " active" : ""}" type="button" data-view-target="${viewId}" aria-current="${isActive ? "page" : "false"}">
+          ${escapeHtml(VIEW_LABELS[viewId])}
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderActiveView() {
+  if (!roleViews().includes(state.activeView)) {
+    state.activeView = "search";
+  }
+  renderShell();
+  qsa("[data-view]").forEach((section) => {
+    section.hidden = section.dataset.view !== state.activeView;
+  });
+  renderDashboardViews();
+}
+
+function statusCard(label, value, detail = "") {
+  return `
+    <article class="status-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${detail ? `<p>${escapeHtml(detail)}</p>` : ""}
+    </article>
+  `;
+}
+
+function renderDashboardViews() {
+  const dashboard = state.dashboard || {};
+  const regs = regulationDocuments();
+  const pending = Number(dashboard.pending_count || 0);
+  const errorCount = Number(dashboard.error_count || 0);
+  const lastScan = formatScanTime(dashboard.last_scan);
+  const latestEffective = latestEffectiveFrom(regs);
+  const currentCount = String(dashboard.current_count ?? regs.length);
+  const totalRegulations = String(dashboard.total_regulations ?? regs.length);
+
+  qs("#latest-view").innerHTML = [
+    statusCard("현재 시행 규정", `${currentCount}건`, `최신 시행일 ${latestEffective}`),
+    statusCard("문서함 규정", `${regs.length}건`, `${totalChunks(regs)}개 조항 청크`),
+    statusCard("권한 기준", ACTOR_LABELS[state.actorRole], "시연용 권한으로 검색 범위가 조정됩니다."),
+  ].join("");
+
+  qs("#updates-view").innerHTML = [
+    statusCard("검토 대기", `${pending}건`, "스캔 후 승인 전 규정"),
+    statusCard("스캔 오류", `${errorCount}건`, "재처리 또는 원본 확인 필요"),
+    statusCard("마지막 스캔", lastScan, "폐쇄망 폴더 기준"),
+  ].join("");
+
+  qs("#history-view").innerHTML = [
+    statusCard("개정 추적", `${totalRegulations}개 규정`, "승인, 대체, 예정 시행 상태 기준"),
+    statusCard("시행 기준일", qs("#as-of").value || "미지정", "통합 검색의 기준일과 연동"),
+    statusCard("최신 시행일", latestEffective, "문서함 메타데이터 기준"),
+  ].join("");
+
+  qs("#permissions-view").innerHTML = [
+    statusCard("감사팀장", "전체 메뉴", "권한 관리와 운영 현황 포함"),
+    statusCard("감사담당자", "감사 메뉴", "권한 관리는 제외"),
+    statusCard("부서장/일반직원", "조회 중심", "업무에 필요한 검색과 문서함 중심"),
+  ].join("");
+
+  qs("#operations-view").innerHTML = [
+    statusCard("폐쇄망", dashboard.offline ? "운영 중" : "확인 필요", "외부 CDN 없이 로컬 정적 자산 사용"),
+    statusCard("검색 서버", state.lastHealth ? `${state.lastHealth.chunks} chunks` : "연결 확인 중", "로컬 API 상태"),
+    statusCard("로컬 이벤트", `${state.localEvents.length}건`, "권한 시뮬레이션 변경 기록 포함"),
+  ].join("");
+}
+
+function renderSyncRail() {
+  const dashboard = state.dashboard || {};
+  const regs = regulationDocuments();
+  qs("#closed-network-state").textContent = dashboard.offline === false ? "폐쇄망 상태 확인 필요" : "폐쇄망 운영 중";
+  qs("#last-scan").textContent = formatScanTime(dashboard.last_scan);
+  qs("#pending-count").textContent = `${Number(dashboard.pending_count || 0)}건`;
+  qs("#latest-effective-date").textContent = latestEffectiveFrom(regs);
+}
+
+async function refreshDashboard() {
+  try {
+    state.dashboard = await api("/api/dashboard");
+  } catch (error) {
+    state.dashboard = { offline: true, pending_count: 0, last_scan: null };
+  }
+  renderSyncRail();
+  renderDashboardViews();
+}
+
 async function refreshHealth() {
   try {
     const health = await api("/api/health");
@@ -231,6 +387,7 @@ async function refreshHealth() {
     qs("#health-dot").className = "dot ok";
     qs("#health-text").textContent = `로컬 서버 연결됨 · ${health.chunks} chunks`;
     qs("#chunk-count").textContent = health.chunks;
+    renderDashboardViews();
   } catch (error) {
     qs("#health-dot").className = "dot error";
     qs("#health-text").textContent = isGitHubPages
@@ -245,10 +402,12 @@ async function refreshDocuments() {
     state.documents = payload.documents || [];
     renderDocumentViews();
     await refreshHealth();
+    await refreshDashboard();
   } catch (error) {
     state.documents = [];
     renderDocumentViews();
     await refreshHealth();
+    await refreshDashboard();
     throw new Error(apiFailureMessage());
   }
 }
@@ -261,6 +420,8 @@ function renderDocumentViews() {
   renderCategoryRail();
   renderDocuments();
   renderCategoryStage();
+  renderSyncRail();
+  renderDashboardViews();
 }
 
 function renderCategoryRail() {
@@ -458,6 +619,7 @@ async function uploadSelectedFile() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
+  await refreshDashboard();
   showToast(`${payload.imported_chunks}개 청크를 추가했습니다.`);
 }
 
@@ -467,6 +629,7 @@ async function ingestLocalFolder() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
+  await refreshDashboard();
   const errorText = payload.errors && payload.errors.length ? ` · 오류 ${payload.errors.length}건` : "";
   showToast(`${payload.imported_chunks}개 청크를 추가했습니다${errorText}.`);
 }
@@ -476,6 +639,7 @@ async function resetIndex() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
+  await refreshDashboard();
   qs("#answer-output").textContent = "샘플 데이터로 초기화했습니다.";
   qs("#results").innerHTML = "";
   qs("#result-count").textContent = "0건";
@@ -484,10 +648,33 @@ async function resetIndex() {
 
 function setQueryAndSearch(query) {
   qs("#query-input").value = query;
+  setActiveView("search");
   runSearch().catch((error) => showToast(error.message));
 }
 
 function bindEvents() {
+  qs("#primary-nav").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-view-target]");
+    if (!button) return;
+    setActiveView(button.dataset.viewTarget);
+  });
+
+  qs("#actor-role").addEventListener("change", (event) => {
+    const nextRole = event.target.value;
+    state.actorRole = nextRole;
+    state.role = ACTOR_API_ROLES[nextRole] || "employee";
+    state.localEvents.unshift({
+      event_type: "RoleSimulationChanged",
+      actor_role: nextRole,
+      occurred_at: new Date().toISOString(),
+    });
+    if (!roleViews().includes(state.activeView)) {
+      state.activeView = "search";
+    }
+    renderActiveView();
+    showToast(`시연용 권한: ${ACTOR_LABELS[nextRole]}`);
+  });
+
   qs("#category-rail").addEventListener("click", (event) => {
     const button = event.target.closest("[data-category]");
     if (!button) return;
@@ -507,15 +694,6 @@ function bindEvents() {
       const button = event.target.closest("[data-query]");
       if (!button) return;
       setQueryAndSearch(button.dataset.query);
-    });
-  });
-
-  qsa(".segment").forEach((button) => {
-    button.addEventListener("click", () => {
-      qsa(".segment").forEach((item) => item.classList.remove("active"));
-      button.classList.add("active");
-      state.role = button.dataset.role;
-      runSearch().catch((error) => showToast(error.message));
     });
   });
 
@@ -544,6 +722,9 @@ function bindEvents() {
 }
 
 async function boot() {
+  state.role = ACTOR_API_ROLES[state.actorRole] || "employee";
+  renderShell();
+  renderActiveView();
   bindEvents();
   renderDocumentViews();
   await refreshDocuments();

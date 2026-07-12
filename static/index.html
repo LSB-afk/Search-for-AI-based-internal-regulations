@@ -3,118 +3,216 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>내부규정 RAG Console</title>
+    <title>천안도시공사 AI 내부규정 검색 시스템</title>
     <link rel="stylesheet" href="static/styles.css" />
   </head>
   <body>
     <div class="app-shell">
-      <header class="topbar">
-        <div>
-          <p class="kicker">On-premise regulation retrieval</p>
-          <h1>내부규정 RAG Console</h1>
+      <header class="app-header">
+        <div class="brand-block">
+          <span class="network-mark"><span class="dot ok"></span>폐쇄망 운영</span>
+          <h1>천안도시공사 AI 내부규정 검색 시스템</h1>
         </div>
-        <div class="status-strip">
-          <span id="health-dot" class="dot"></span>
-          <span id="health-text">연결 확인 중</span>
+        <div class="identity-switcher">
+          <span class="simulation-badge">시연용 권한</span>
+          <label class="sr-only" for="actor-role">시연 사용자 권한</label>
+          <select id="actor-role" aria-label="시연 사용자 권한">
+            <option value="audit_lead">감사팀장</option>
+            <option value="auditor">감사담당자</option>
+            <option value="department_head">부서장</option>
+            <option value="employee" selected>일반직원</option>
+          </select>
         </div>
       </header>
 
-      <nav id="category-rail" class="category-rail" aria-label="규정 항목"></nav>
+      <section class="sync-rail" aria-label="규정 동기화 레일">
+        <div class="sync-title">
+          <span class="sync-label">규정 동기화 레일</span>
+          <strong id="closed-network-state">폐쇄망 상태 확인 중</strong>
+        </div>
+        <div class="sync-metric">
+          <span>마지막 스캔</span>
+          <strong id="last-scan">확인 중</strong>
+        </div>
+        <div class="sync-metric">
+          <span>검토 대기</span>
+          <strong id="pending-count">0건</strong>
+        </div>
+        <div class="sync-metric">
+          <span>최신 시행일</span>
+          <strong id="latest-effective-date">시행일 미상</strong>
+        </div>
+        <div class="sync-metric">
+          <span>검색 서버</span>
+          <strong><span id="health-dot" class="dot"></span><span id="health-text">연결 확인 중</span></strong>
+        </div>
+      </section>
 
-      <main class="workspace">
-        <aside class="control-panel" aria-label="검색 조건">
-          <section class="panel-section">
-            <label class="field-label" for="role-control">사용자 권한</label>
-            <div id="role-control" class="segmented" role="radiogroup" aria-label="사용자 권한">
-              <button class="segment active" data-role="employee" type="button">일반직원</button>
-              <button class="segment" data-role="audit" type="button">감사실</button>
-              <button class="segment" data-role="admin" type="button">관리자</button>
-            </div>
-          </section>
+      <nav id="primary-nav" class="primary-nav" aria-label="주요 업무"></nav>
 
-          <section class="panel-section">
-            <label class="field-label" for="as-of">시행 기준일</label>
-            <input id="as-of" class="date-input" type="date" value="2026-05-27" />
-          </section>
+      <main id="view-root" class="view-root">
+        <section class="view-section" data-view="search" aria-labelledby="search-view-title">
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Regulation retrieval</p>
+              <h2 id="search-view-title">통합 검색</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
+          </div>
+          <div class="workspace">
+            <aside class="control-panel" aria-label="검색 조건">
+              <section class="panel-section">
+                <label class="field-label" for="as-of">시행 기준일</label>
+                <input id="as-of" class="date-input" type="date" value="2026-05-27" />
+              </section>
 
-          <section class="panel-section">
-            <label class="field-label" for="file-input">문서 추가</label>
-            <input id="file-input" class="file-input" type="file" accept=".pdf,.hwpx,.hwp,.zip" />
-            <button id="upload-button" class="secondary-button" type="button">업로드 색인</button>
-            <button id="local-ingest-button" class="secondary-button" type="button">현재 폴더 색인</button>
-            <button id="reset-button" class="ghost-button" type="button">샘플로 초기화</button>
-          </section>
+              <section class="panel-section">
+                <label class="field-label" for="file-input">문서 추가</label>
+                <input id="file-input" class="file-input" type="file" accept=".pdf,.hwpx,.hwp,.zip" />
+                <button id="upload-button" class="secondary-button" type="button">업로드 색인</button>
+                <button id="local-ingest-button" class="secondary-button" type="button">현재 폴더 색인</button>
+                <button id="reset-button" class="ghost-button" type="button">샘플로 초기화</button>
+              </section>
 
-          <section class="panel-section compact">
-            <div class="metric-line">
-              <span>문서</span>
-              <strong id="doc-count">0</strong>
-            </div>
-            <div class="metric-line">
-              <span>규정</span>
-              <strong id="regulation-metric">0</strong>
-            </div>
-            <div class="metric-line">
-              <span>청크</span>
-              <strong id="chunk-count">0</strong>
-            </div>
-          </section>
-        </aside>
+              <section class="panel-section compact">
+                <div class="metric-line">
+                  <span>문서</span>
+                  <strong id="doc-count">0</strong>
+                </div>
+                <div class="metric-line">
+                  <span>규정</span>
+                  <strong id="regulation-metric">0</strong>
+                </div>
+                <div class="metric-line">
+                  <span>청크</span>
+                  <strong id="chunk-count">0</strong>
+                </div>
+              </section>
+            </aside>
 
-        <section class="search-panel" aria-label="질의 응답">
-          <form id="search-form" class="query-form">
-            <label class="field-label" for="query-input">질문</label>
-            <textarea id="query-input" rows="4">2026년 기준 징계양정은 어떤 규정을 봐야 하나?</textarea>
-            <div class="query-actions">
-              <div class="quick-queries" aria-label="질문 예시">
-                <button type="button" data-query="감사자료 제출 권한은 누가 가지나?">감사자료</button>
-                <button type="button" data-query="2024년 기준 재난 상황에서는 어떤 지침이 우선인가?">재난 우선</button>
-                <button type="button" data-query="대외비 문서 열람은 어떤 조건이 필요한가?">대외비</button>
-              </div>
-              <button class="primary-button" type="submit">검색</button>
-            </div>
-          </form>
+            <section class="search-panel" aria-label="질의 응답">
+              <form id="search-form" class="query-form">
+                <label class="field-label" for="query-input">질문</label>
+                <textarea id="query-input" rows="4">2026년 기준 징계양정은 어떤 규정을 봐야 하나?</textarea>
+                <div class="query-actions">
+                  <div class="quick-queries" aria-label="질문 예시">
+                    <button type="button" data-query="감사자료 제출 권한은 누가 가지나?">감사자료</button>
+                    <button type="button" data-query="2024년 기준 재난 상황에서는 어떤 지침이 우선인가?">재난 우선</button>
+                    <button type="button" data-query="대외비 문서 열람은 어떤 조건이 필요한가?">대외비</button>
+                  </div>
+                  <button class="primary-button" type="submit">검색</button>
+                </div>
+              </form>
 
-          <section class="answer-zone" aria-live="polite">
-            <div class="answer-header">
-              <h2>답변</h2>
-              <div id="filter-summary" class="filter-summary"></div>
-            </div>
-            <pre id="answer-output" class="answer-output">질문을 입력하고 검색하세요.</pre>
-          </section>
+              <section class="answer-zone" aria-live="polite">
+                <div class="answer-header">
+                  <h2>답변</h2>
+                  <div id="filter-summary" class="filter-summary"></div>
+                </div>
+                <pre id="answer-output" class="answer-output">질문을 입력하고 검색하세요.</pre>
+              </section>
 
-          <section>
-            <div class="section-title">
-              <h2>근거 조항</h2>
-              <span id="result-count">0건</span>
-            </div>
-            <div id="results" class="results-list"></div>
-          </section>
+              <section>
+                <div class="section-title">
+                  <h2>근거 조항</h2>
+                  <span id="result-count">0건</span>
+                </div>
+                <div id="results" class="results-list"></div>
+              </section>
+            </section>
+          </div>
         </section>
 
-        <aside class="documents-panel" aria-label="규정 문서 하네스">
-          <div class="section-title">
-            <h2>규정 문서 하네스</h2>
-            <span id="regulation-count">0건</span>
+        <section class="view-section" data-view="latest" aria-labelledby="latest-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Effective regulations</p>
+              <h2 id="latest-view-title">최신 규정</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
           </div>
-          <input id="document-filter" class="document-filter" type="search" placeholder="문서명 검색" />
-          <div id="harness-summary" class="harness-summary"></div>
-          <div id="documents" class="document-list"></div>
-        </aside>
-      </main>
+          <div id="latest-view" class="operations-grid"></div>
+        </section>
 
-      <section class="category-stage" aria-label="항목별 규정 화면">
-        <div class="category-stage-head">
-          <div>
-            <p id="category-kicker" class="kicker">Regulation Sections</p>
-            <h2 id="category-title">전체 규정</h2>
+        <section class="view-section" data-view="updates" aria-labelledby="updates-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Review queue</p>
+              <h2 id="updates-view-title">업데이트 센터</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
           </div>
-          <span id="category-count">0건</span>
-        </div>
-        <div id="category-snapshot" class="category-snapshot"></div>
-        <div id="category-queries" class="category-queries"></div>
-        <div id="category-documents" class="category-documents"></div>
-      </section>
+          <div id="updates-view" class="operations-grid"></div>
+        </section>
+
+        <section class="view-section" data-view="history" aria-labelledby="history-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Revision trace</p>
+              <h2 id="history-view-title">개정 이력</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
+          </div>
+          <div id="history-view" class="operations-grid"></div>
+        </section>
+
+        <section class="view-section" data-view="library" aria-labelledby="library-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Regulation library</p>
+              <h2 id="library-view-title">규정 문서함</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
+          </div>
+          <nav id="category-rail" class="category-rail" aria-label="규정 항목"></nav>
+          <div class="library-grid">
+            <aside class="documents-panel" aria-label="규정 문서함">
+              <div class="section-title">
+                <h2>규정 문서함</h2>
+                <span id="regulation-count">0건</span>
+              </div>
+              <input id="document-filter" class="document-filter" type="search" placeholder="문서명 검색" />
+              <div id="harness-summary" class="harness-summary"></div>
+              <div id="documents" class="document-list"></div>
+            </aside>
+
+            <section class="category-stage" aria-label="항목별 규정 화면">
+              <div class="category-stage-head">
+                <div>
+                  <p id="category-kicker" class="kicker">Regulation Sections</p>
+                  <h2 id="category-title">전체 규정</h2>
+                </div>
+                <span id="category-count">0건</span>
+              </div>
+              <div id="category-snapshot" class="category-snapshot"></div>
+              <div id="category-queries" class="category-queries"></div>
+              <div id="category-documents" class="category-documents"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view-section" data-view="permissions" aria-labelledby="permissions-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Access control</p>
+              <h2 id="permissions-view-title">권한 관리</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
+          </div>
+          <div id="permissions-view" class="operations-grid"></div>
+        </section>
+
+        <section class="view-section" data-view="operations" aria-labelledby="operations-view-title" hidden>
+          <div class="view-heading">
+            <div>
+              <p class="kicker">Offline operations</p>
+              <h2 id="operations-view-title">운영 현황</h2>
+            </div>
+            <span class="simulation-badge">권한 시뮬레이션</span>
+          </div>
+          <div id="operations-view" class="operations-grid"></div>
+        </section>
+      </main>
 
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </div>
