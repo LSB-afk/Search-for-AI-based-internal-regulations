@@ -460,6 +460,33 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual(events[0]["metadata"]["outcome"], "read_failed")
         self.assertEqual(events[0]["metadata"]["version_id"], "version-read-failed")
 
+    def test_source_download_send_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
+        source.write_bytes(b"private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문?query=private&path=/secret",
+            source_file=source.name,
+            source_type="hwp",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-source-send-failed"
+
+        with mock.patch.object(server, "send_bytes", side_effect=BrokenPipeError("client closed")):
+            with self.assertRaises(BrokenPipeError):
+                server.source_download(mock.Mock(), chunk)
+
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        event_json = json.dumps(events[0], ensure_ascii=False)
+        self.assertEqual(events[0]["metadata"]["outcome"], "send_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-source-send-failed")
+        self.assertNotIn("SourceDownloaded", event_json)
+        self.assertNotIn("문서 본문", event_json)
+        self.assertNotIn("query=private", event_json)
+        self.assertNotIn("/secret", event_json)
+
     def test_source_pdf_existing_pdf_read_failure_records_failure_not_success(self):
         source = Path(self.tmp.name) / "인사규정_2026.01.01.pdf"
         source.write_bytes(b"%PDF private source bytes")
@@ -484,6 +511,33 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual(events[0]["metadata"]["outcome"], "read_failed")
         self.assertEqual(events[0]["metadata"]["version_id"], "version-pdf-read-failed")
 
+    def test_source_pdf_existing_pdf_send_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.pdf"
+        source.write_bytes(b"%PDF private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문?query=private&path=/secret",
+            source_file=source.name,
+            source_type="pdf",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-pdf-send-failed"
+
+        with mock.patch.object(server, "send_bytes", side_effect=BrokenPipeError("client closed")):
+            with self.assertRaises(BrokenPipeError):
+                server.source_pdf_download(mock.Mock(), chunk)
+
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        event_json = json.dumps(events[0], ensure_ascii=False)
+        self.assertEqual(events[0]["metadata"]["outcome"], "send_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-pdf-send-failed")
+        self.assertNotIn("SourceDownloaded", event_json)
+        self.assertNotIn("문서 본문", event_json)
+        self.assertNotIn("query=private", event_json)
+        self.assertNotIn("/secret", event_json)
+
     def test_source_pdf_conversion_failure_records_failure_not_success(self):
         source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
         source.write_bytes(b"private source bytes")
@@ -507,6 +561,36 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
         self.assertEqual(events[0]["metadata"]["outcome"], "conversion_failed")
         self.assertEqual(events[0]["metadata"]["version_id"], "version-conversion-failed")
+
+    def test_source_pdf_converted_send_failure_records_failure_not_success(self):
+        source = Path(self.tmp.name) / "인사규정_2026.01.01.hwp"
+        source.write_bytes(b"private source bytes")
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="문서 본문?query=private&path=/secret",
+            source_file=source.name,
+            source_type="hwp",
+            source_path=str(source),
+        )
+        chunk["version_id"] = "version-converted-send-failed"
+
+        with (
+            mock.patch.object(server, "make_source_pdf", return_value=b"%PDF converted bytes"),
+            mock.patch.object(server, "send_bytes", side_effect=BrokenPipeError("client closed")),
+        ):
+            with self.assertRaises(BrokenPipeError):
+                server.source_pdf_download(mock.Mock(), chunk)
+
+        events = self.registry.events(10)
+        self.assertEqual([event["event_type"] for event in events], ["SourceDownloadFailed"])
+        event_json = json.dumps(events[0], ensure_ascii=False)
+        self.assertEqual(events[0]["metadata"]["outcome"], "send_failed")
+        self.assertEqual(events[0]["metadata"]["version_id"], "version-converted-send-failed")
+        self.assertNotIn("SourceDownloaded", event_json)
+        self.assertNotIn("문서 본문", event_json)
+        self.assertNotIn("query=private", event_json)
+        self.assertNotIn("/secret", event_json)
 
     def test_source_pdf_existing_pdf_success_records_success_after_reading_bytes(self):
         source = Path(self.tmp.name) / "인사규정_2026.01.01.pdf"

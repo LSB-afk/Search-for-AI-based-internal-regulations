@@ -1075,6 +1075,21 @@ def record_missing_source_download_event(requested_id: str) -> None:
     )
 
 
+def send_source_download_bytes(
+    handler: BaseHTTPRequestHandler,
+    chunk: dict[str, Any],
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+) -> None:
+    try:
+        send_bytes(handler, data, filename=filename, content_type=content_type)
+    except OSError:
+        record_source_download_event(chunk, "SourceDownloadFailed", "send_failed")
+        raise
+
+
 def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> None:
     source_path = chunk.get("source_path")
     if not source_path:
@@ -1093,7 +1108,7 @@ def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> N
         record_source_download_event(chunk, "SourceDownloadFailed", "read_failed")
         handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
         return
-    send_bytes(handler, data, filename=path.name, content_type=content_type)
+    send_source_download_bytes(handler, chunk, data, filename=path.name, content_type=content_type)
     record_source_download_event(chunk, "SourceDownloaded", "success")
 
 
@@ -1127,7 +1142,7 @@ def source_pdf_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) 
             record_source_download_event(chunk, "SourceDownloadFailed", "read_failed")
             handler.send_error(HTTPStatus.NOT_FOUND, "source file is not available")
             return
-        send_bytes(handler, data, filename=path.name, content_type="application/pdf")
+        send_source_download_bytes(handler, chunk, data, filename=path.name, content_type="application/pdf")
         record_source_download_event(chunk, "SourceDownloaded", "success")
         return
     filename = safe_download_name(f"{path.stem}_원본", ".pdf")
@@ -1137,7 +1152,7 @@ def source_pdf_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) 
         record_source_download_event(chunk, "SourceDownloadFailed", "conversion_failed")
         handler.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "source file could not be converted")
         return
-    send_bytes(handler, data, filename=filename, content_type="application/pdf")
+    send_source_download_bytes(handler, chunk, data, filename=filename, content_type="application/pdf")
     record_source_download_event(chunk, "SourceDownloaded", "success")
 
 
