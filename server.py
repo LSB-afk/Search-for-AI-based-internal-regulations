@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from regulation_registry import RegulationRegistry
+
 try:
     import pdfplumber  # type: ignore
 except Exception:  # pragma: no cover - handled at runtime
@@ -37,6 +39,7 @@ STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
 UPLOADS_DIR = ROOT / "uploads"
 INDEX_FILE = DATA_DIR / "index.json"
+REGISTRY_FILE = DATA_DIR / "regulation_registry.json"
 WORKSPACE_DIR = ROOT.parent
 HWP5TXT = Path(os.environ.get("HWP5TXT_BIN") or shutil.which("hwp5txt") or "/opt/anaconda3/bin/hwp5txt")
 BUNDLED_PYTHON = Path(
@@ -75,6 +78,8 @@ STOPWORDS = {
     "부터",
     "으로써",
 }
+
+REGISTRY = RegulationRegistry(REGISTRY_FILE)
 
 
 def configured_source_roots() -> list[Path]:
@@ -895,22 +900,15 @@ def local_sources() -> list[Path]:
 
 
 def ingest_local_sources() -> dict[str, Any]:
-    imported = 0
-    errors: list[str] = []
-    seen_sources = {
-        source
-        for chunk in load_index().get("chunks", [])
-        for source in (chunk.get("source_path"), chunk.get("source_file"), chunk.get("batch_source"))
-        if source
-    }
-    for source in local_sources():
-        if str(source.resolve()) in seen_sources or source.name in seen_sources:
-            continue
-        try:
-            imported += add_chunks(ingest_file(source))
-        except Exception as exc:
-            errors.append(f"{source.name}: {exc}")
-    return {"imported_chunks": imported, "errors": errors, "documents": document_summary()}
+    result = REGISTRY.scan_sources(
+        local_sources(),
+        ingest=lambda path: ingest_file(path),
+        effective_date=lambda path: date_from_text(path.name),
+    )
+    if result["chunks"]:
+        add_chunks(result.pop("chunks"))
+    result["documents"] = document_summary()
+    return result
 
 
 def safe_upload_name(filename: str) -> str:

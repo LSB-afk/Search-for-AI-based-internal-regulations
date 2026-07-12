@@ -112,6 +112,108 @@ class RegulationRegistryTest(unittest.TestCase):
         second = self.registry.record_detection("회계규정", "/closed/b.hwp", "same", "2026-05-27", ["b"])
         self.assertEqual(first["version_id"], second["version_id"])
 
+    def test_scan_detects_new_unchanged_and_changed_files(self):
+        source = Path(self.tmp.name) / "인사규정_2026.05.27.hwp"
+        source.write_bytes(b"version-one")
+
+        first = self.registry.scan_sources(
+            [source],
+            lambda path: ["chunk-v1"],
+            effective_date=lambda path: "2026-05-27",
+        )
+        second = self.registry.scan_sources(
+            [source],
+            lambda path: ["chunk-v1"],
+            effective_date=lambda path: "2026-05-27",
+        )
+        source.write_bytes(b"version-two")
+        third = self.registry.scan_sources(
+            [source],
+            lambda path: ["chunk-v2"],
+            effective_date=lambda path: "2026-06-01",
+        )
+
+        self.assertEqual(first["new_count"], 1)
+        self.assertEqual(second["unchanged_count"], 1)
+        self.assertEqual(third["changed_count"], 1)
+        self.assertEqual(first["chunks"], [])
+
+    def test_scan_injects_version_metadata_into_chunk_dicts(self):
+        source = Path(self.tmp.name) / "감사규정_2026.05.27.pdf"
+        source.write_bytes(b"pdf-version")
+
+        result = self.registry.scan_sources(
+            [source],
+            lambda path: [{"id": "chunk-1", "text": "감사 자료"}],
+            effective_date=lambda path: "2026-05-27",
+        )
+
+        self.assertEqual(result["new_count"], 1)
+        self.assertEqual(len(result["chunks"]), 1)
+        chunk = result["chunks"][0]
+        version = next(iter(self.registry.state["versions"].values()))
+        self.assertEqual(chunk["regulation_id"], version["regulation_id"])
+        self.assertEqual(chunk["version_id"], version["version_id"])
+        self.assertEqual(chunk["version_status"], "pending")
+
+    def test_scan_isolates_parser_failures(self):
+        good = Path(self.tmp.name) / "복무규정_2026.05.27.hwp"
+        bad = Path(self.tmp.name) / "회계규정_2026.05.27.hwp"
+        good.write_bytes(b"good")
+        bad.write_bytes(b"bad")
+
+        def ingest(path):
+            if path == bad:
+                raise RuntimeError("broken parser")
+            return ["good-chunk"]
+
+        result = self.registry.scan_sources(
+            [good, bad],
+            ingest,
+            effective_date=lambda path: "2026-05-27",
+        )
+
+        self.assertEqual(result["new_count"], 1)
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["source_path"], str(bad.resolve()))
+        self.assertEqual(result["errors"][0]["error"], "broken parser")
+        self.assertEqual(
+            [event["event_type"] for event in self.registry.events()],
+            ["detected", "RegulationVersionScanFailed"],
+        )
+        error_versions = [
+            version for version in self.registry.state["versions"].values() if version["status"] == "scan_error"
+        ]
+        self.assertEqual(len(error_versions), 1)
+
+    def test_scan_retries_sources_after_parser_failure(self):
+        source = Path(self.tmp.name) / "회계규정_2026.05.27.hwp"
+        source.write_bytes(b"same-content")
+        attempts = 0
+
+        def ingest(path):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary parser failure")
+            return ["chunk-after-retry"]
+
+        first = self.registry.scan_sources(
+            [source],
+            ingest,
+            effective_date=lambda path: "2026-05-27",
+        )
+        second = self.registry.scan_sources(
+            [source],
+            ingest,
+            effective_date=lambda path: "2026-05-27",
+        )
+
+        self.assertEqual(first["error_count"], 1)
+        self.assertEqual(second["new_count"], 1)
+        self.assertEqual(attempts, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
