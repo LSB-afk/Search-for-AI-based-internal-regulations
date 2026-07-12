@@ -146,6 +146,32 @@ class SearchVersionFilterTest(IsolatedServerTest):
         self.assertEqual(result["as_of"], date.today().isoformat())
         self.assertEqual([item["version_id"] for item in result["results"]], [current["version_id"]])
 
+    def test_search_index_uses_query_detected_basis_date_for_version_filter(self):
+        old = self.registry.record_detection("인사규정", "/closed/old.hwp", "old-query-date-hash", "2025-01-01", ["old-c"])
+        self.registry.approve_version(old["version_id"], "감사팀장", "2025-01-01", today="2026-07-12")
+        current = self.registry.record_detection(
+            "인사규정", "/closed/current.hwp", "current-query-date-hash", "2026-05-27", ["current-c"]
+        )
+        self.registry.approve_version(current["version_id"], "감사팀장", "2026-05-27", today="2026-07-12")
+        chunks = []
+        for label, version in (("구버전", old), ("최신본", current)):
+            chunk = server.make_chunk(
+                doc_title="인사규정",
+                section_title=label,
+                text=f"징계 {label} 기준",
+                effective_from=version["effective_from"],
+                effective_to=version["effective_to"],
+                source_type="hwp",
+            )
+            chunk["version_id"] = version["version_id"]
+            chunks.append(chunk)
+        self.write_chunks(chunks)
+
+        result = server.search_index("2025년 6월 기준 징계 기준", "employee", None)
+
+        self.assertEqual(result["as_of"], "2025-06-30")
+        self.assertEqual([item["version_id"] for item in result["results"]], [old["version_id"]])
+
     def test_unversioned_sample_chunks_remain_searchable_before_first_approval(self):
         chunks = [
             server.make_chunk(

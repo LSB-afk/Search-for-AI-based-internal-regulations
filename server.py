@@ -611,16 +611,16 @@ def search_index(
 ) -> dict[str, Any]:
     payload = load_index()
     chunks = payload.get("chunks", [])
-    effective_as_of = as_of or date.today().isoformat()
-    allowed_versions = REGISTRY.versions(effective_as_of, include_history=include_history)
+    effective_search_date = detect_date(query, as_of) or date.today().isoformat()
+    allowed_versions = REGISTRY.versions(effective_search_date, include_history=include_history)
     allowed_version_ids = {
-        version["version_id"] for version in allowed_versions if version_is_effective(version, effective_as_of)
+        version["version_id"] for version in allowed_versions if version_is_effective(version, effective_search_date)
     }
     return search_chunks(
         chunks,
         query,
         role,
-        effective_as_of,
+        effective_search_date,
         limit,
         allowed_version_ids=allowed_version_ids,
         include_history=include_history,
