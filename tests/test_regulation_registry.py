@@ -38,6 +38,32 @@ class RegulationRegistryTest(unittest.TestCase):
         old_version = next(item for item in history if item["version_id"] == old["version_id"])
         self.assertEqual(old_version["effective_to"], "2026-05-26")
 
+    def test_historical_approval_after_current_version_closes_old_window(self):
+        new = self.registry.record_detection(
+            canonical_title="인사규정",
+            source_path="/closed/인사규정_2026.05.27.hwp",
+            content_hash="new-hash",
+            effective_from="2026-05-27",
+            chunk_ids=["new-1"],
+        )
+        self.registry.approve_version(new["version_id"], "감사팀장", "2026-05-27", today="2026-07-12")
+        old = self.registry.record_detection(
+            canonical_title="인사규정",
+            source_path="/closed/인사규정_2025.01.01.hwp",
+            content_hash="old-hash",
+            effective_from="2025-01-01",
+            chunk_ids=["old-1"],
+        )
+        self.registry.approve_version(old["version_id"], "감사팀장", "2025-01-01", today="2026-07-12")
+
+        current = self.registry.versions(as_of="2026-07-12", include_history=False)
+        history = self.registry.versions(as_of="2026-07-12", include_history=True)
+        old_version = next(item for item in history if item["version_id"] == old["version_id"])
+
+        self.assertEqual([item["version_id"] for item in current], [new["version_id"]])
+        self.assertEqual(old_version["status"], "superseded")
+        self.assertEqual(old_version["effective_to"], "2026-05-26")
+
     def test_future_version_is_scheduled_until_effective_date(self):
         version = self.registry.record_detection(
             canonical_title="감사규정",

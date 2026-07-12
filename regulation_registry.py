@@ -5,7 +5,7 @@ import json
 import re
 import unicodedata
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -98,12 +98,7 @@ class RegulationRegistry:
         effective_day = _parse_iso_date(effective_from)
         version["status"] = "scheduled" if effective_day > current_day else "approved"
 
-        for previous in self._versions_for_regulation(version["regulation_id"]):
-            if previous["version_id"] == version_id or previous["status"] != "approved":
-                continue
-            if _parse_iso_date(previous["effective_from"]) < effective_day:
-                previous["status"] = "superseded"
-                previous["effective_to"] = (effective_day - timedelta(days=1)).isoformat()
+        self._recompute_effective_windows(version["regulation_id"], current_day)
 
         self._append_event(
             "approved",
@@ -193,6 +188,29 @@ class RegulationRegistry:
     def _versions_for_regulation(self, regulation_id: str) -> list[dict[str, Any]]:
         version_ids = self.state["regulations"][regulation_id]["versions"]
         return [self.state["versions"][version_id] for version_id in version_ids]
+
+    def _recompute_effective_windows(self, regulation_id: str, current_day: date) -> None:
+        versions = [
+            version
+            for version in self._versions_for_regulation(regulation_id)
+            if version["status"] in {"approved", "scheduled", "superseded"}
+        ]
+        versions.sort(key=lambda version: (_parse_iso_date(version["effective_from"]), version["version_id"]))
+
+        for index, version in enumerate(versions):
+            effective_day = _parse_iso_date(version["effective_from"])
+            next_version = versions[index + 1] if index + 1 < len(versions) else None
+            next_effective_day = _parse_iso_date(next_version["effective_from"]) if next_version else None
+
+            version["effective_to"] = (
+                (next_effective_day - timedelta(days=1)).isoformat() if next_effective_day else None
+            )
+            if effective_day > current_day:
+                version["status"] = "scheduled"
+            elif next_effective_day is not None and next_effective_day <= current_day:
+                version["status"] = "superseded"
+            else:
+                version["status"] = "approved"
 
     def _sorted_versions(self) -> list[dict[str, Any]]:
         return sorted(
