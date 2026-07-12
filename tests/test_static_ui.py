@@ -93,6 +93,78 @@ class ProductShellStaticTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertRegex(CSS, rf"{re.escape(name)}:\s*{re.escape(value)};")
 
+    def test_operations_loader_uses_required_endpoints_and_offline_state(self):
+        self.assertIn("async function refreshOperations()", JS)
+        for endpoint in ('"/api/dashboard"', '"/api/versions"', '"/api/events?limit=100"'):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, JS)
+        self.assertRegex(JS, r"state\.versions\s*=\s*versions\.versions\s*\|\|\s*\[\]")
+        self.assertRegex(JS, r"state\.events\s*=\s*events\.events\s*\|\|\s*\[\]")
+        self.assertIn("operationOffline", JS)
+        self.assertIn("로컬 운영 서버 연결 필요", JS)
+        self.assertIn("renderActiveView();", JS)
+
+    def test_required_operations_view_renderers_exist(self):
+        for function_name in (
+            "renderLatestView",
+            "renderUpdatesView",
+            "renderHistoryView",
+            "renderPermissionsView",
+            "renderOperationsView",
+        ):
+            with self.subTest(function_name=function_name):
+                self.assertIn(f"function {function_name}()", JS)
+        for view_id in ("latest-view", "updates-view", "history-view", "permissions-view", "operations-view"):
+            with self.subTest(view_id=view_id):
+                self.assertIn(f'#{view_id}', JS)
+
+    def test_latest_only_checkbox_controls_include_history(self):
+        self.assertIn('id="latest-only"', HTML)
+        self.assertIn("최신본만", HTML)
+        self.assertRegex(HTML, r'id="latest-only"[^>]*checked')
+        self.assertIn("include_history: !qs(\"#latest-only\").checked", JS)
+
+    def test_approval_rejection_flow_is_audit_lead_only(self):
+        self.assertIn("async function approveVersion(versionId, effectiveFrom)", JS)
+        self.assertIn("async function rejectVersion(versionId)", JS)
+        self.assertIn('"/api/versions/approve"', JS)
+        self.assertIn('"/api/versions/reject"', JS)
+        self.assertIn('actor: "감사팀장(시연)"', JS)
+        self.assertRegex(JS, r"state\.actorRole\s*===\s*\"audit_lead\"")
+        self.assertIn("승인", JS)
+        self.assertIn("반려", JS)
+
+    def test_restricted_results_hide_body_and_download(self):
+        self.assertIn("function isRestrictedResult(item)", JS)
+        self.assertIn("restricted-result", JS)
+        self.assertIn("상위 권한 필요", JS)
+        self.assertIn("lock-mark", CSS)
+        self.assertRegex(JS, r"if\s*\(\s*isRestrictedResult\(item\)\s*\)")
+
+    def test_timeline_status_copy_hashes_and_empty_states_are_present(self):
+        for copy in ("현재본", "시행 예정", "이전 버전", "반려", "오류", "검토 대기"):
+            with self.subTest(copy=copy):
+                self.assertIn(copy, JS)
+        self.assertIn(".slice(0, 10)", JS)
+        self.assertIn('title="${escapeHtml(version.content_hash || "")}"', JS)
+        for empty_copy in ("표시할 최신 규정이 없습니다.", "검토 대기 항목이 없습니다.", "개정 이력이 없습니다."):
+            with self.subTest(empty_copy=empty_copy):
+                self.assertIn(empty_copy, JS)
+
+    def test_permissions_hierarchy_and_operations_density_are_rendered(self):
+        for copy in ("감사팀장", "감사담당자", "부서장", "일반직원", "허용 화면"):
+            with self.subTest(copy=copy):
+                self.assertIn(copy, JS)
+        self.assertIn("permission-level", CSS)
+        for metric in ("전체 규정", "최신본", "검토 대기", "오류", "마지막 스캔", "감사 이벤트"):
+            with self.subTest(metric=metric):
+                self.assertIn(metric, JS)
+
+    def test_long_names_and_mobile_controls_wrap_without_overlap(self):
+        for marker in ("overflow-wrap: anywhere", "min-width: 0", "grid-template-columns: 1fr"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, CSS)
+
 
 ROLE_VALUES = {"audit_lead", "auditor", "department_head", "employee"}
 

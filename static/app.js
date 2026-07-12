@@ -4,6 +4,10 @@ const state = {
   role: "employee",
   documents: [],
   dashboard: null,
+  versions: [],
+  events: [],
+  selectedRegulationId: null,
+  operationOffline: false,
   localEvents: [],
   lastHealth: null,
   activeCategory: "all",
@@ -43,6 +47,21 @@ const ACTOR_LABELS = {
 
 const REGULATION_TYPES = new Set(["hwp", "hwpx", "pdf"]);
 const CATEGORY_FALLBACK_ID = "operations";
+const STATUS_LABELS = {
+  approved: "현재본",
+  scheduled: "시행 예정",
+  superseded: "이전 버전",
+  rejected: "반려",
+  scan_error: "오류",
+  detected: "검토 대기",
+  pending: "검토 대기",
+};
+const ROLE_PERMISSIONS = {
+  audit_lead: ["search", "latest", "updates", "history", "library", "permissions", "operations"],
+  auditor: ["search", "latest", "updates", "history", "library", "operations"],
+  department_head: ["search", "latest", "history", "library"],
+  employee: ["search", "latest", "library"],
+};
 const CATEGORIES = [
   {
     id: "all",
@@ -200,6 +219,13 @@ function normalizeText(value) {
   return String(value ?? "").normalize("NFC");
 }
 
+function selectorValue(value) {
+  if (window.CSS && typeof window.CSS.escape === "function") {
+    return window.CSS.escape(String(value));
+  }
+  return String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
 function sourceTypes(doc) {
   return (doc.source_types || []).map((type) => String(type).toLowerCase());
 }
@@ -248,6 +274,69 @@ function totalChunks(docs) {
 function latestEffectiveFrom(docs) {
   const dates = docs.map((doc) => doc.effective_from).filter(Boolean).sort();
   return dates.length ? dates[dates.length - 1] : "시행일 미상";
+}
+
+function operationAsOf() {
+  return qs("#as-of")?.value || new Date().toISOString().slice(0, 10);
+}
+
+function versionTitle(version) {
+  return normalizeText(version.canonical_title || version.doc_title || "규정명 미상");
+}
+
+function versionStatusLabel(version) {
+  return STATUS_LABELS[version.status] || version.status || "상태 미상";
+}
+
+function versionsByRegulation() {
+  const groups = new Map();
+  state.versions.forEach((version) => {
+    const key = version.regulation_id || versionTitle(version);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(version);
+  });
+  return groups;
+}
+
+function sortedVersions(versions) {
+  return [...versions].sort((a, b) => {
+    const dateCompare = String(b.effective_from || "").localeCompare(String(a.effective_from || ""));
+    if (dateCompare) return dateCompare;
+    return String(b.version_id || "").localeCompare(String(a.version_id || ""));
+  });
+}
+
+function latestCurrentVersions() {
+  const asOf = operationAsOf();
+  const rows = [];
+  versionsByRegulation().forEach((versions) => {
+    const eligible = versions.filter((version) => {
+      if (version.status === "approved") return true;
+      return version.status === "scheduled" && String(version.effective_from || "") <= asOf;
+    });
+    if (!eligible.length) return;
+    const latest = sortedVersions(eligible)[0];
+    rows.push({ ...latest, version_count: versions.length });
+  });
+  return rows.sort((a, b) => String(b.effective_from || "").localeCompare(String(a.effective_from || "")));
+}
+
+function pendingVersions() {
+  return sortedVersions(state.versions.filter((version) => ["detected", "pending"].includes(version.status)));
+}
+
+function scanErrorVersions() {
+  return sortedVersions(state.versions.filter((version) => version.status === "scan_error"));
+}
+
+function offlineNotice() {
+  if (!state.operationOffline) return "";
+  return `
+    <div class="offline-state" role="status">
+      <strong>로컬 운영 서버 연결 필요</strong>
+      <span>GitHub Pages 또는 정적 파일에서는 화면을 유지하며, 127.0.0.1:8765 API 연결 후 최신 운영 데이터를 불러옵니다.</span>
+    </div>
+  `;
 }
 
 function formatScanTime(scan) {
@@ -307,7 +396,11 @@ function renderActiveView() {
   qsa("[data-view]").forEach((section) => {
     section.hidden = section.dataset.view !== state.activeView;
   });
-  renderDashboardViews();
+  renderLatestView();
+  renderUpdatesView();
+  renderHistoryView();
+  renderPermissionsView();
+  renderOperationsView();
 }
 
 function statusCard(label, value, detail = "") {
@@ -320,45 +413,216 @@ function statusCard(label, value, detail = "") {
   `;
 }
 
-function renderDashboardViews() {
+function renderLatestView() {
+  const rows = latestCurrentVersions();
+  const root = qs("#latest-view");
+  const cards = [
+    statusCard("최신본", `${rows.length}건`, "승인본과 기준일이 도래한 시행 예정본"),
+    statusCard("시행 기준일", operationAsOf(), "통합 검색 기준일과 동일하게 표시"),
+    statusCard("권한 기준", ACTOR_LABELS[state.actorRole], "시연용 권한으로 검색 범위가 조정됩니다."),
+  ];
+  const list = rows.length
+    ? `
+      <div class="operation-table">
+        ${rows
+          .map(
+            (version) => `
+              <article class="operation-row">
+                <div class="operation-main">
+                  <strong>${escapeHtml(versionTitle(version))}</strong>
+                  <span>시행일 ${escapeHtml(version.effective_from || "시행일 미상")}</span>
+                </div>
+                <span class="status-pill ${escapeHtml(version.status || "")}">${escapeHtml(versionStatusLabel(version))}</span>
+                <span>${Number(version.version_count || 1)}개 버전</span>
+                <button class="mini-action" data-query="${escapeHtml(versionTitle(version))}" type="button">원본 검색</button>
+              </article>
+            `,
+          )
+          .join("")}
+      </div>
+    `
+    : `<div class="empty-state">표시할 최신 규정이 없습니다.</div>`;
+  root.innerHTML = `${offlineNotice()}${cards.join("")}${list}`;
+}
+
+function renderUpdatesView() {
+  const root = qs("#updates-view");
+  const pending = pendingVersions();
+  const errors = scanErrorVersions();
+  const canReview = state.actorRole === "audit_lead";
+  const cards = [
+    statusCard("검토 대기", `${pending.length}건`, "스캔 후 승인 전 규정"),
+    statusCard("오류", `${errors.length}건`, "재처리 또는 원본 확인 필요"),
+    statusCard("검토 권한", canReview ? "감사팀장" : "조회 전용", "모든 역할 표시는 시연용입니다."),
+  ];
+  const pendingList = pending.length
+    ? pending
+        .map((version) => {
+          const effectiveFrom = version.effective_from || operationAsOf();
+          const controls = canReview
+            ? `
+              <div class="review-actions">
+                <input class="date-input compact-date" type="date" value="${escapeHtml(effectiveFrom)}" data-effective-for="${escapeHtml(version.version_id)}" aria-label="승인 시행일" />
+                <button class="mini-action" type="button" data-approve-version="${escapeHtml(version.version_id)}">승인</button>
+                <button class="mini-action danger-action" type="button" data-reject-version="${escapeHtml(version.version_id)}">반려</button>
+              </div>
+            `
+            : `<span class="simulation-note">시연용 조회 역할: 승인·반려 동작 없음</span>`;
+          return `
+            <article class="review-row">
+              <div class="operation-main">
+                <strong>${escapeHtml(versionTitle(version))}</strong>
+                <span>${escapeHtml(version.source_path || "원본 경로 미상")}</span>
+              </div>
+              <span class="status-pill ${escapeHtml(version.status || "")}">${escapeHtml(versionStatusLabel(version))}</span>
+              ${controls}
+            </article>
+          `;
+        })
+        .join("")
+    : `<div class="empty-state">검토 대기 항목이 없습니다.</div>`;
+  const errorList = errors.length
+    ? `
+      <div class="operation-table">
+        ${errors
+          .map(
+            (version) => `
+              <article class="operation-row">
+                <div class="operation-main">
+                  <strong>${escapeHtml(versionTitle(version))}</strong>
+                  <span>${escapeHtml(version.source_path || "오류 원본 미상")}</span>
+                </div>
+                <span class="status-pill scan_error">오류</span>
+              </article>
+            `,
+          )
+          .join("")}
+      </div>
+    `
+    : "";
+  root.innerHTML = `${offlineNotice()}${cards.join("")}<div class="review-list">${pendingList}</div>${errorList}`;
+}
+
+function renderHistoryView() {
+  const root = qs("#history-view");
+  const groups = versionsByRegulation();
+  const regulationIds = Array.from(groups.keys()).sort((a, b) => versionTitle(groups.get(a)[0]).localeCompare(versionTitle(groups.get(b)[0]), "ko"));
+  if (!regulationIds.length) {
+    root.innerHTML = `${offlineNotice()}<div class="empty-state">개정 이력이 없습니다.</div>`;
+    return;
+  }
+  if (!state.selectedRegulationId || !groups.has(state.selectedRegulationId)) {
+    state.selectedRegulationId = regulationIds[0];
+  }
+  const selector = `
+    <div class="history-selector">
+      ${regulationIds
+        .map((regulationId) => {
+          const selected = regulationId === state.selectedRegulationId;
+          return `<button class="category-tab${selected ? " active" : ""}" type="button" data-history-regulation="${escapeHtml(regulationId)}">${escapeHtml(versionTitle(groups.get(regulationId)[0]))}</button>`;
+        })
+        .join("")}
+    </div>
+  `;
+  const timeline = sortedVersions(groups.get(state.selectedRegulationId)).map((version) => {
+    const hash = version.content_hash || "";
+    return `
+      <article class="timeline-item ${escapeHtml(version.status || "")}">
+        <div class="timeline-stem"></div>
+        <div class="timeline-content">
+          <div class="result-title">
+            <div>
+              <strong>${escapeHtml(versionTitle(version))}</strong>
+              <span>${escapeHtml(version.effective_from || "시행일 미상")} ${version.effective_to ? `~ ${escapeHtml(version.effective_to)}` : ""}</span>
+            </div>
+            <span class="status-pill ${escapeHtml(version.status || "")}">${escapeHtml(versionStatusLabel(version))}</span>
+          </div>
+          <div class="meta-row">
+            <span class="badge" title="${escapeHtml(version.content_hash || "")}">${escapeHtml(hash ? hash.slice(0, 10) : "hash 없음")}</span>
+            <span class="badge">${escapeHtml(version.change_type || "변경 유형 미상")}</span>
+            <span class="badge">${escapeHtml(version.version_id || "version 없음")}</span>
+          </div>
+        </div>
+      </article>
+    `;
+  });
+  root.innerHTML = `${offlineNotice()}${statusCard("개정 이력", `${regulationIds.length}개 규정`, "현재본, 시행 예정, 이전 버전, 반려, 오류 상태를 함께 표시합니다.")}${selector}<div class="timeline">${timeline.join("")}</div>`;
+}
+
+function renderPermissionsView() {
+  const root = qs("#permissions-view");
+  const hierarchy = ["audit_lead", "auditor", "department_head", "employee"];
+  root.innerHTML = `
+    ${offlineNotice()}
+    <div class="permission-tree" aria-label="권한 계층">
+      ${hierarchy
+        .map(
+          (role, index) => `
+            <article class="permission-level level-${index}">
+              <div>
+                <strong>${escapeHtml(ACTOR_LABELS[role])}</strong>
+                <span>권한 시뮬레이션</span>
+              </div>
+              <p>허용 화면</p>
+              <div class="meta-row">
+                ${(ROLE_PERMISSIONS[role] || []).map((view) => `<span class="badge">${escapeHtml(VIEW_LABELS[view])}</span>`).join("")}
+              </div>
+            </article>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderOperationsView() {
   const dashboard = state.dashboard || {};
   const regs = regulationDocuments();
   const pending = Number(dashboard.pending_count || 0);
   const errorCount = Number(dashboard.error_count || 0);
   const lastScan = formatScanTime(dashboard.last_scan);
-  const latestEffective = latestEffectiveFrom(regs);
   const currentCount = String(dashboard.current_count ?? regs.length);
   const totalRegulations = String(dashboard.total_regulations ?? regs.length);
+  const events = [...state.localEvents, ...state.events].slice(0, 100);
+  const eventRows = events.length
+    ? events
+        .map(
+          (event) => `
+            <tr>
+              <td>${escapeHtml(event.occurred_at || event.created_at || "시각 미상")}</td>
+              <td>${escapeHtml(event.event_type || "감사 이벤트")}</td>
+              <td>${escapeHtml(event.version_id || event.actor_role || "")}</td>
+            </tr>
+          `,
+        )
+        .join("")
+    : `<tr><td colspan="3">감사 이벤트가 없습니다.</td></tr>`;
+  qs("#operations-view").innerHTML = `
+    ${offlineNotice()}
+    ${[
+      statusCard("전체 규정", `${totalRegulations}건`, "레지스트리 기준"),
+      statusCard("최신본", `${currentCount}건`, "현재 검색 기본 범위"),
+      statusCard("검토 대기", `${pending}건`, "승인 전 항목"),
+      statusCard("오류", `${errorCount}건`, "스캔 실패 또는 원본 확인 필요"),
+      statusCard("마지막 스캔", lastScan, "폐쇄망 폴더 기준"),
+      statusCard("검색 서버", state.lastHealth ? `${state.lastHealth.chunks} chunks` : "연결 확인 중", "로컬 API 상태"),
+    ].join("")}
+    <section class="audit-events">
+      <h3>감사 이벤트</h3>
+      <table>
+        <thead><tr><th>시각</th><th>이벤트</th><th>대상</th></tr></thead>
+        <tbody>${eventRows}</tbody>
+      </table>
+    </section>
+  `;
+}
 
-  qs("#latest-view").innerHTML = [
-    statusCard("현재 시행 규정", `${currentCount}건`, `최신 시행일 ${latestEffective}`),
-    statusCard("문서함 규정", `${regs.length}건`, `${totalChunks(regs)}개 조항 청크`),
-    statusCard("권한 기준", ACTOR_LABELS[state.actorRole], "시연용 권한으로 검색 범위가 조정됩니다."),
-  ].join("");
-
-  qs("#updates-view").innerHTML = [
-    statusCard("검토 대기", `${pending}건`, "스캔 후 승인 전 규정"),
-    statusCard("스캔 오류", `${errorCount}건`, "재처리 또는 원본 확인 필요"),
-    statusCard("마지막 스캔", lastScan, "폐쇄망 폴더 기준"),
-  ].join("");
-
-  qs("#history-view").innerHTML = [
-    statusCard("개정 추적", `${totalRegulations}개 규정`, "승인, 대체, 예정 시행 상태 기준"),
-    statusCard("시행 기준일", qs("#as-of").value || "미지정", "통합 검색의 기준일과 연동"),
-    statusCard("최신 시행일", latestEffective, "문서함 메타데이터 기준"),
-  ].join("");
-
-  qs("#permissions-view").innerHTML = [
-    statusCard("감사팀장", "전체 메뉴", "권한 관리와 운영 현황 포함"),
-    statusCard("감사담당자", "감사 메뉴", "권한 관리는 제외"),
-    statusCard("부서장/일반직원", "조회 중심", "업무에 필요한 검색과 문서함 중심"),
-  ].join("");
-
-  qs("#operations-view").innerHTML = [
-    statusCard("폐쇄망", dashboard.offline ? "운영 중" : "확인 필요", "외부 CDN 없이 로컬 정적 자산 사용"),
-    statusCard("검색 서버", state.lastHealth ? `${state.lastHealth.chunks} chunks` : "연결 확인 중", "로컬 API 상태"),
-    statusCard("로컬 이벤트", `${state.localEvents.length}건`, "권한 시뮬레이션 변경 기록 포함"),
-  ].join("");
+function renderDashboardViews() {
+  renderLatestView();
+  renderUpdatesView();
+  renderHistoryView();
+  renderPermissionsView();
+  renderOperationsView();
 }
 
 function renderSyncRail() {
@@ -367,7 +631,7 @@ function renderSyncRail() {
   qs("#closed-network-state").textContent = dashboard.offline === false ? "폐쇄망 상태 확인 필요" : "폐쇄망 운영 중";
   qs("#last-scan").textContent = formatScanTime(dashboard.last_scan);
   qs("#pending-count").textContent = `${Number(dashboard.pending_count || 0)}건`;
-  qs("#latest-effective-date").textContent = latestEffectiveFrom(regs);
+  qs("#latest-effective-date").textContent = latestCurrentVersions()[0]?.effective_from || latestEffectiveFrom(regs);
 }
 
 async function refreshDashboard() {
@@ -378,6 +642,26 @@ async function refreshDashboard() {
   }
   renderSyncRail();
   renderDashboardViews();
+}
+
+async function refreshOperations() {
+  try {
+    const [dashboard, versions, events] = await Promise.all([
+      api("/api/dashboard"),
+      api("/api/versions"),
+      api("/api/events?limit=100"),
+    ]);
+    state.dashboard = dashboard;
+    state.versions = versions.versions || [];
+    state.events = events.events || [];
+    state.operationOffline = false;
+  } catch (error) {
+    state.operationOffline = true;
+    state.dashboard = state.dashboard || { offline: true, pending_count: 0, error_count: 0, last_scan: null };
+  }
+  renderSyncRail();
+  renderShell();
+  renderActiveView();
 }
 
 async function refreshHealth() {
@@ -402,12 +686,12 @@ async function refreshDocuments() {
     state.documents = payload.documents || [];
     renderDocumentViews();
     await refreshHealth();
-    await refreshDashboard();
+    await refreshOperations();
   } catch (error) {
     state.documents = [];
     renderDocumentViews();
     await refreshHealth();
-    await refreshDashboard();
+    await refreshOperations();
     throw new Error(apiFailureMessage());
   }
 }
@@ -422,6 +706,24 @@ function renderDocumentViews() {
   renderCategoryStage();
   renderSyncRail();
   renderDashboardViews();
+}
+
+async function approveVersion(versionId, effectiveFrom) {
+  await api("/api/versions/approve", {
+    method: "POST",
+    body: JSON.stringify({ version_id: versionId, effective_from: effectiveFrom, actor: "감사팀장(시연)" }),
+  });
+  showToast("최신 규정으로 승인했습니다. 시연용 상태 변경입니다.");
+  await refreshOperations();
+}
+
+async function rejectVersion(versionId) {
+  await api("/api/versions/reject", {
+    method: "POST",
+    body: JSON.stringify({ version_id: versionId, reason: "시행일 또는 규정명 재확인", actor: "감사팀장(시연)" }),
+  });
+  showToast("검토 항목을 반려했습니다.");
+  await refreshOperations();
 }
 
 function renderCategoryRail() {
@@ -515,6 +817,10 @@ function renderCategoryStage() {
     .join("");
 }
 
+function isRestrictedResult(item) {
+  return item.restricted === true || item.blocked === true || item.allowed === false || item.access === "restricted";
+}
+
 function renderResults(payload) {
   qs("#answer-output").textContent = payload.answer || "";
   qs("#result-count").textContent = `${(payload.results || []).length}건`;
@@ -536,6 +842,20 @@ function renderResults(payload) {
       const page = item.page ? `p.${item.page}` : "page 없음";
       const sourceHref = item.download && item.source_path ? apiUrl(item.download.source) : "";
       const sourcePdfHref = item.download && item.source_path ? apiUrl(item.download.source_pdf) : "";
+      if (isRestrictedResult(item)) {
+        return `
+          <article class="result-card restricted-result">
+            <div class="result-title">
+              <div>
+                <strong>${escapeHtml(item.doc_title || "제한 문서")}</strong>
+                <span>${escapeHtml(item.section_title || "권한 제한")}</span>
+              </div>
+              <span class="lock-mark" aria-hidden="true">잠금</span>
+            </div>
+            <p class="restricted-copy">상위 권한 필요</p>
+          </article>
+        `;
+      }
       return `
         <article class="result-card">
           <div class="result-title">
@@ -581,6 +901,7 @@ async function runSearch() {
         role: state.role,
         as_of: qs("#as-of").value,
         limit: 6,
+        include_history: !qs("#latest-only").checked,
       }),
     });
     renderResults(payload);
@@ -619,7 +940,7 @@ async function uploadSelectedFile() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
-  await refreshDashboard();
+  await refreshOperations();
   showToast(`${payload.imported_chunks}개 청크를 추가했습니다.`);
 }
 
@@ -629,7 +950,7 @@ async function ingestLocalFolder() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
-  await refreshDashboard();
+  await refreshOperations();
   const errorText = payload.errors && payload.errors.length ? ` · 오류 ${payload.errors.length}건` : "";
   showToast(`${payload.imported_chunks}개 청크를 추가했습니다${errorText}.`);
 }
@@ -639,7 +960,7 @@ async function resetIndex() {
   state.documents = payload.documents || [];
   renderDocumentViews();
   await refreshHealth();
-  await refreshDashboard();
+  await refreshOperations();
   qs("#answer-output").textContent = "샘플 데이터로 초기화했습니다.";
   qs("#results").innerHTML = "";
   qs("#result-count").textContent = "0건";
@@ -689,6 +1010,15 @@ function bindEvents() {
     renderDocuments();
   });
 
+  qs("#as-of").addEventListener("change", () => {
+    renderSyncRail();
+    renderDashboardViews();
+  });
+
+  qs("#latest-only").addEventListener("change", () => {
+    qs("#filter-summary").textContent = qs("#latest-only").checked ? "최신본만" : "개정 이력 포함";
+  });
+
   qsa("#documents, #category-queries, #category-documents").forEach((root) => {
     root.addEventListener("click", (event) => {
       const button = event.target.closest("[data-query]");
@@ -719,6 +1049,38 @@ function bindEvents() {
   qs("#reset-button").addEventListener("click", () => {
     resetIndex().catch((error) => showToast(error.message));
   });
+
+  qsa("#latest-view, #updates-view, #history-view").forEach((root) => {
+    root.addEventListener("click", (event) => {
+      const queryButton = event.target.closest("[data-query]");
+      if (queryButton) {
+        setQueryAndSearch(queryButton.dataset.query);
+        return;
+      }
+
+      const historyButton = event.target.closest("[data-history-regulation]");
+      if (historyButton) {
+        state.selectedRegulationId = historyButton.dataset.historyRegulation;
+        renderHistoryView();
+        return;
+      }
+
+      const approveButton = event.target.closest("[data-approve-version]");
+      if (approveButton) {
+        if (state.actorRole !== "audit_lead") return;
+        const versionId = approveButton.dataset.approveVersion;
+        const input = qs(`[data-effective-for="${selectorValue(versionId)}"]`);
+        approveVersion(versionId, input?.value || operationAsOf()).catch((error) => showToast(error.message));
+        return;
+      }
+
+      const rejectButton = event.target.closest("[data-reject-version]");
+      if (rejectButton) {
+        if (state.actorRole !== "audit_lead") return;
+        rejectVersion(rejectButton.dataset.rejectVersion).catch((error) => showToast(error.message));
+      }
+    });
+  });
 }
 
 async function boot() {
@@ -728,6 +1090,7 @@ async function boot() {
   bindEvents();
   renderDocumentViews();
   await refreshDocuments();
+  await refreshOperations();
   await runSearch();
 }
 
