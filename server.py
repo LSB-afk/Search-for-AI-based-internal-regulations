@@ -611,15 +611,16 @@ def search_index(
 ) -> dict[str, Any]:
     payload = load_index()
     chunks = payload.get("chunks", [])
-    allowed_versions = REGISTRY.versions(as_of, include_history=include_history)
+    effective_as_of = as_of or date.today().isoformat()
+    allowed_versions = REGISTRY.versions(effective_as_of, include_history=include_history)
     allowed_version_ids = {
-        version["version_id"] for version in allowed_versions if version_is_effective(version, as_of)
+        version["version_id"] for version in allowed_versions if version_is_effective(version, effective_as_of)
     }
     return search_chunks(
         chunks,
         query,
         role,
-        as_of,
+        effective_as_of,
         limit,
         allowed_version_ids=allowed_version_ids,
         include_history=include_history,
@@ -1394,9 +1395,12 @@ def bounded_limit(raw_value: str | None, default: int = 100, maximum: int = 500)
     if raw_value is None:
         return default
     try:
-        return max(0, min(int(raw_value), maximum))
+        limit = int(raw_value)
     except ValueError:
         raise ValueError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    return min(limit, maximum)
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
@@ -1442,7 +1446,10 @@ class RegRagHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return {}
         data = self.rfile.read(length)
-        return json.loads(data.decode("utf-8"))
+        body = json.loads(data.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("JSON object body is required")
+        return body
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)

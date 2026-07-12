@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -122,6 +123,29 @@ class SearchVersionFilterTest(IsolatedServerTest):
 
         self.assertEqual([item["version_id"] for item in result["results"]], [old["version_id"]])
 
+    def test_search_history_without_as_of_excludes_2027_scheduled_version_today(self):
+        current = self.registry.record_detection("인사규정", "/closed/current.hwp", "current-hash", "2026-01-01", ["cur-c"])
+        self.registry.approve_version(current["version_id"], "감사팀장", "2026-01-01", today="2026-07-12")
+        future = self.registry.record_detection("인사규정", "/closed/future.hwp", "future-hash", "2027-01-01", ["future-c"])
+        self.registry.approve_version(future["version_id"], "감사팀장", "2027-01-01", today="2026-07-12")
+        chunks = []
+        for label, version in (("현재", current), ("예정", future)):
+            chunk = server.make_chunk(
+                doc_title="인사규정",
+                section_title=label,
+                text=f"징계 {label} 기준",
+                effective_from=version["effective_from"],
+                source_type="hwp",
+            )
+            chunk["version_id"] = version["version_id"]
+            chunks.append(chunk)
+        self.write_chunks(chunks)
+
+        result = server.search_index("징계 기준", "employee", None, include_history=True)
+
+        self.assertEqual(result["as_of"], date.today().isoformat())
+        self.assertEqual([item["version_id"] for item in result["results"]], [current["version_id"]])
+
     def test_unversioned_sample_chunks_remain_searchable_before_first_approval(self):
         chunks = [
             server.make_chunk(
@@ -156,13 +180,29 @@ class ApiRoutesTest(IsolatedServerTest):
         url = self.base_url + path
         if query:
             url += "?" + urlencode(query)
-        with urlopen(url, timeout=5) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(url, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
 
     def post_json(self, path, body):
         request = Request(
             self.base_url + path,
             data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def post_raw_json(self, path, raw_json):
+        request = Request(
+            self.base_url + path,
+            data=raw_json.encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -188,6 +228,17 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual([item["version_id"] for item in versions["versions"]], [pending["version_id"]])
         self.assertEqual(events_status, 200)
         self.assertEqual(len(events["events"]), 1)
+
+    def test_events_rejects_limit_below_one(self):
+        self.registry.record_detection("인사규정", "/closed/one.hwp", "hash-one", "2026-05-27", ["c1"])
+
+        zero_status, zero_body = self.get_json("/api/events", {"limit": "0"})
+        negative_status, negative_body = self.get_json("/api/events", {"limit": "-1"})
+
+        self.assertEqual(zero_status, 400)
+        self.assertIn("limit", zero_body["error"])
+        self.assertEqual(negative_status, 400)
+        self.assertIn("limit", negative_body["error"])
 
     def test_approval_and_rejection_routes_validate_json_errors(self):
         version = self.registry.record_detection("인사규정", "/closed/new.hwp", "hash", "2026-05-27", ["c"])
@@ -227,6 +278,15 @@ class ApiRoutesTest(IsolatedServerTest):
 
         self.assertEqual(status, 400)
         self.assertIn("as_of", body["error"])
+
+    def test_post_routes_reject_valid_non_object_json_bodies(self):
+        array_status, array_body = self.post_raw_json("/api/search", "[]")
+        null_status, null_body = self.post_raw_json("/api/versions/approve", "null")
+
+        self.assertEqual(array_status, 400)
+        self.assertIn("JSON object", array_body["error"])
+        self.assertEqual(null_status, 400)
+        self.assertIn("JSON object", null_body["error"])
 
 
 if __name__ == "__main__":
