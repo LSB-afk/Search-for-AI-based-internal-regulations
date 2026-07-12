@@ -417,12 +417,40 @@ def is_effective(chunk: dict[str, Any], as_of: str | None) -> bool:
     return True
 
 
+def version_is_effective(version: dict[str, Any], as_of: str | None) -> bool:
+    if version.get("status") not in {"approved", "scheduled", "superseded"}:
+        return False
+    if not as_of:
+        return True
+    point = parse_date_value(as_of)
+    if not point:
+        return True
+    start = parse_date_value(version.get("effective_from"))
+    end = parse_date_value(version.get("effective_to"))
+    if start and point < start:
+        return False
+    if end and point > end:
+        return False
+    return True
+
+
 def build_idf(chunks: list[dict[str, Any]]) -> dict[str, float]:
     doc_count = max(len(chunks), 1)
     df: Counter[str] = Counter()
     for chunk in chunks:
         df.update(set(tokenize(f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}")))
     return {term: math.log((doc_count + 1) / (freq + 0.5)) + 1 for term, freq in df.items()}
+
+
+def validate_api_date(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError(f"{field_name} must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError(f"{field_name} must be YYYY-MM-DD")
 
 
 def score_chunk(chunk: dict[str, Any], terms: list[str], idf: dict[str, float]) -> tuple[float, list[str]]:
@@ -506,18 +534,27 @@ def summarize_text(text: str, terms: list[str], max_sentences: int = 3) -> str:
     return "\n".join(bullets)
 
 
-def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> dict[str, Any]:
-    payload = load_index()
-    chunks = payload.get("chunks", [])
+def search_chunks(
+    chunks: list[dict[str, Any]],
+    query: str,
+    role: str,
+    as_of: str | None,
+    limit: int,
+    allowed_version_ids: set[str] | None = None,
+    include_history: bool = False,
+) -> dict[str, Any]:
     explicit_or_detected_date = detect_date(query, as_of)
     query_terms = expand_terms(tokenize(query))
     idf = build_idf(chunks)
     real_source_available = any(chunk.get("source_type") != "sample" for chunk in chunks)
-
     blocked_count = 0
     date_filtered_count = 0
     scored: list[dict[str, Any]] = []
     for chunk in chunks:
+        version_id = chunk.get("version_id")
+        if version_id and allowed_version_ids is not None and version_id not in allowed_version_ids:
+            date_filtered_count += 1
+            continue
         if not can_access(role, chunk.get("permission", "internal")):
             blocked_count += 1
             continue
@@ -561,7 +598,32 @@ def search_index(query: str, role: str, as_of: str | None, limit: int = 6) -> di
         "blocked_count": blocked_count,
         "date_filtered_count": date_filtered_count,
         "total_chunks": len(chunks),
+        "include_history": include_history,
     }
+
+
+def search_index(
+    query: str,
+    role: str,
+    as_of: str | None,
+    limit: int = 6,
+    include_history: bool = False,
+) -> dict[str, Any]:
+    payload = load_index()
+    chunks = payload.get("chunks", [])
+    allowed_versions = REGISTRY.versions(as_of, include_history=include_history)
+    allowed_version_ids = {
+        version["version_id"] for version in allowed_versions if version_is_effective(version, as_of)
+    }
+    return search_chunks(
+        chunks,
+        query,
+        role,
+        as_of,
+        limit,
+        allowed_version_ids=allowed_version_ids,
+        include_history=include_history,
+    )
 
 
 def generate_answer(
@@ -1291,6 +1353,52 @@ def make_result_hwp_html(chunk: dict[str, Any]) -> bytes:
     return body.encode("utf-8")
 
 
+def operation_error(message: str) -> dict[str, str]:
+    return {"error": message}
+
+
+def dashboard_payload() -> dict[str, Any]:
+    versions = list(REGISTRY.state.get("versions", {}).values())
+    current_count = len(REGISTRY.versions(None, include_history=False))
+    pending_count = sum(1 for version in versions if version.get("status") in {"detected", "pending"})
+    error_count = sum(1 for version in versions if version.get("status") == "scan_error")
+    scan_runs = REGISTRY.state.get("scan_runs", [])
+    return {
+        "total_regulations": len(REGISTRY.state.get("regulations", {})),
+        "current_count": current_count,
+        "pending_count": pending_count,
+        "error_count": error_count,
+        "last_scan": scan_runs[-1] if scan_runs else None,
+        "offline": True,
+    }
+
+
+def versions_payload(status: str | None = None, regulation_id: str | None = None) -> dict[str, Any]:
+    versions = []
+    for version in REGISTRY.state.get("versions", {}).values():
+        if regulation_id and version.get("regulation_id") != regulation_id:
+            continue
+        version_status = version.get("status")
+        if status:
+            if status == "pending":
+                if version_status not in {"detected", "pending"}:
+                    continue
+            elif version_status != status:
+                continue
+        versions.append({**version})
+    versions.sort(key=lambda item: (item.get("canonical_title", ""), item.get("effective_from", ""), item["version_id"]))
+    return {"versions": versions}
+
+
+def bounded_limit(raw_value: str | None, default: int = 100, maximum: int = 500) -> int:
+    if raw_value is None:
+        return default
+    try:
+        return max(0, min(int(raw_value), maximum))
+    except ValueError:
+        raise ValueError("limit must be an integer")
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -1367,6 +1475,24 @@ class RegRagHandler(BaseHTTPRequestHandler):
         if path == "/api/documents":
             json_response(self, HTTPStatus.OK, {"documents": document_summary()})
             return
+        if path == "/api/dashboard":
+            json_response(self, HTTPStatus.OK, dashboard_payload())
+            return
+        if path == "/api/versions":
+            qs = parse_qs(parsed.query)
+            status = (qs.get("status") or [None])[0]
+            regulation_id = (qs.get("regulation_id") or [None])[0]
+            json_response(self, HTTPStatus.OK, versions_payload(status=status, regulation_id=regulation_id))
+            return
+        if path == "/api/events":
+            qs = parse_qs(parsed.query)
+            try:
+                limit = bounded_limit((qs.get("limit") or [None])[0])
+            except ValueError as exc:
+                json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
+                return
+            json_response(self, HTTPStatus.OK, {"events": REGISTRY.events(limit)})
+            return
         if path == "/api/chunks":
             qs = parse_qs(parsed.query)
             limit = int((qs.get("limit") or ["25"])[0])
@@ -1408,6 +1534,9 @@ class RegRagHandler(BaseHTTPRequestHandler):
             filename = safe_download_name(f"{chunk.get('doc_title', 'result')}_검색결과", ".pdf")
             send_bytes(self, make_result_pdf(chunk), filename=filename, content_type="application/pdf")
             return
+        if path.startswith("/api/"):
+            json_response(self, HTTPStatus.NOT_FOUND, operation_error("not found"))
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1416,13 +1545,62 @@ class RegRagHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/search":
                 body = self.read_json_body()
+                try:
+                    as_of = validate_api_date(body.get("as_of"), "as_of")
+                except ValueError as exc:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
+                    return
                 result = search_index(
                     query=str(body.get("query", "")),
                     role=str(body.get("role", "employee")),
-                    as_of=body.get("as_of"),
+                    as_of=as_of,
                     limit=int(body.get("limit", 6)),
+                    include_history=bool(body.get("include_history", False)),
                 )
                 json_response(self, HTTPStatus.OK, result)
+                return
+            if path == "/api/versions/approve":
+                body = self.read_json_body()
+                version_id = body.get("version_id")
+                effective_from = body.get("effective_from")
+                actor = str(body.get("actor") or "감사팀장(시연)")
+                if not version_id:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error("version_id is required"))
+                    return
+                if not effective_from:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error("effective_from is required"))
+                    return
+                try:
+                    effective_from = validate_api_date(effective_from, "effective_from")
+                    version = REGISTRY.approve_version(str(version_id), actor, effective_from)
+                except KeyError:
+                    json_response(self, HTTPStatus.NOT_FOUND, operation_error("version_id not found"))
+                    return
+                except ValueError as exc:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
+                    return
+                json_response(self, HTTPStatus.OK, {"version": version, "simulation": True})
+                return
+            if path == "/api/versions/reject":
+                body = self.read_json_body()
+                version_id = body.get("version_id")
+                reason = body.get("reason")
+                actor = str(body.get("actor") or "감사팀장(시연)")
+                if not version_id:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error("version_id is required"))
+                    return
+                if not reason:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error("reason is required"))
+                    return
+                try:
+                    version = REGISTRY.reject_version(str(version_id), actor, str(reason))
+                except KeyError:
+                    json_response(self, HTTPStatus.NOT_FOUND, operation_error("version_id not found"))
+                    return
+                except ValueError as exc:
+                    json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
+                    return
+                json_response(self, HTTPStatus.OK, {"version": version, "simulation": True})
                 return
             if path == "/api/upload":
                 body = self.read_json_body()
@@ -1450,6 +1628,10 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, {"documents": document_summary()})
                 return
             json_response(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except json.JSONDecodeError:
+            json_response(self, HTTPStatus.BAD_REQUEST, operation_error("invalid JSON body"))
+        except ValueError as exc:
+            json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
         except Exception as exc:
             json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 

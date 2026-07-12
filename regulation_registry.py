@@ -139,10 +139,14 @@ class RegulationRegistry:
 
     def versions(self, as_of: str | None = None, include_history: bool = False) -> list[dict[str, Any]]:
         if include_history:
-            return [copy.deepcopy(version) for version in self._sorted_versions()]
+            return [
+                copy.deepcopy(version)
+                for version in self._sorted_versions()
+                if version["status"] in {"approved", "scheduled", "superseded"}
+            ]
 
         as_of_day = _parse_iso_date(as_of or _today_iso())
-        current = []
+        allowed = []
         for version in self._sorted_versions():
             if version["status"] not in {"approved", "scheduled", "superseded"}:
                 continue
@@ -152,8 +156,8 @@ class RegulationRegistry:
                 continue
             if effective_to is not None and _parse_iso_date(effective_to) < as_of_day:
                 continue
-            current.append(copy.deepcopy(version))
-        return current
+            allowed.append(copy.deepcopy(version))
+        return allowed
 
     def events(self, limit: int = 100) -> list[dict[str, Any]]:
         return copy.deepcopy(self.state["events"][-limit:])
