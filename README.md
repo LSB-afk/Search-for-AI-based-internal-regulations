@@ -19,6 +19,12 @@ python3 server.py
 
 브라우저에서 `http://127.0.0.1:8765`를 엽니다.
 
+승인, 반려, 업로드, 재색인, 초기화 API는 기본적으로 비활성화됩니다. 화면 시연 중 해당 변경 동작까지 사용할 때만 다음처럼 명시적으로 활성화합니다. 이 플래그는 실제 사용자 인증을 대신하지 않습니다.
+
+```bash
+REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 server.py
+```
+
 전체 단위 테스트와 브라우저 E2E는 다음처럼 실행합니다. E2E에는 Python Playwright와 Chromium이 설치되어 있어야 합니다.
 
 ```bash
@@ -75,7 +81,11 @@ REG_RAG_PDF_PYTHON=/path/to/python3 python3 server.py
 
 ## 로컬 규정 색인
 
-서버 실행 후 화면의 로컬 색인 기능이나 API를 사용하면 현재 워크스페이스의 규정 파일을 색인합니다.
+서버 실행 후 화면의 로컬 색인 기능이나 API를 사용하면 현재 워크스페이스의 규정 파일을 색인합니다. API로 실행하려면 서버를 시연 변경 플래그와 함께 시작한 뒤 요청합니다.
+
+```bash
+REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 server.py
+```
 
 ```bash
 curl -X POST http://127.0.0.1:8765/api/ingest-local
@@ -106,6 +116,14 @@ https://lsb-afk.github.io/Search-for-AI-based-internal-regulations/
 ```
 
 이 URL은 기본적으로 현재 PC의 로컬 검색 API(`http://127.0.0.1:8765`)에 연결합니다. 실제 검색을 하려면 로컬에서 서버가 실행 중이어야 합니다. Chrome에서 로컬 네트워크 접근 권한을 묻는 경우 허용해야 검색됩니다.
+
+GitHub Pages 시연판에서 로컬 API 호출을 허용하려면 서버 실행 시 Pages 출처를 명시합니다. 승인·반려까지 시연할 때만 두 번째 플래그를 함께 사용합니다.
+
+```bash
+REG_RAG_ALLOWED_ORIGINS="https://lsb-afk.github.io" \
+REG_RAG_ENABLE_DEMO_MUTATIONS=1 \
+python3 server.py
+```
 
 별도 HTTPS 백엔드 API를 연결할 때는 다음처럼 엽니다.
 

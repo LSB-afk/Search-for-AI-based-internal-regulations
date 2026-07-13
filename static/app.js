@@ -56,6 +56,20 @@ const STATUS_LABELS = {
   detected: "검토 대기",
   pending: "검토 대기",
 };
+const EVENT_LABELS = {
+  RegulationVersionDetected: "버전 감지",
+  RegulationVersionIndexed: "검색 색인",
+  RegulationVersionApproved: "승인 완료",
+  RegulationVersionScheduled: "시행 예정",
+  RegulationVersionRejected: "버전 반려",
+  RegulationVersionSuperseded: "이전본 종료",
+  ScheduledVersionActivated: "예약본 시행",
+  RegulationVersionScanFailed: "색인 실패",
+  SearchExecuted: "규정 검색",
+  SourceDownloaded: "원본 다운로드",
+  SourceDownloadFailed: "다운로드 실패",
+  RoleSimulationChanged: "권한 전환",
+};
 const ROLE_PERMISSIONS = {
   audit_lead: ["search", "latest", "updates", "history", "library", "permissions", "operations"],
   auditor: ["search", "latest", "updates", "history", "library", "operations"],
@@ -213,6 +227,15 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function eventLabel(event) {
+  return EVENT_LABELS[event.event_type] || event.event_type || "감사 이벤트";
+}
+
+function eventTarget(event) {
+  const value = String(event.target_id || event.version_id || event.actor_role || "");
+  return value.length > 12 ? `${value.slice(0, 8)}...` : value;
 }
 
 function normalizeText(value) {
@@ -589,9 +612,9 @@ function renderOperationsView() {
         .map(
           (event) => `
             <tr>
-              <td>${escapeHtml(event.occurred_at || event.created_at || "시각 미상")}</td>
-              <td>${escapeHtml(event.event_type || "감사 이벤트")}</td>
-              <td>${escapeHtml(event.version_id || event.actor_role || "")}</td>
+              <td>${escapeHtml(formatScanTime({ finished_at: event.occurred_at || event.created_at }))}</td>
+              <td>${escapeHtml(eventLabel(event))}</td>
+              <td>${escapeHtml(eventTarget(event))}</td>
             </tr>
           `,
         )

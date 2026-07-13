@@ -107,6 +107,7 @@ def application_server():
             {
                 "REG_RAG_SOURCE_DIRS": str(workspace),
                 "REG_RAG_AUTO_INGEST": "1",
+                "REG_RAG_ENABLE_DEMO_MUTATIONS": "1",
             }
         )
         process = subprocess.Popen(

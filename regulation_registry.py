@@ -9,6 +9,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 EMPTY_STATE = {
@@ -19,6 +20,8 @@ EMPTY_STATE = {
     "events": [],
 }
 
+BUSINESS_TIMEZONE = ZoneInfo("Asia/Seoul")
+
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -27,8 +30,11 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _today_iso() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+def business_today_iso(now: datetime | None = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(BUSINESS_TIMEZONE).date().isoformat()
 
 
 def _parse_iso_date(value: str) -> datetime.date:
@@ -60,7 +66,7 @@ class RegulationRegistry:
         canonical_title: str,
         source_path: str,
         content_hash: str,
-        effective_from: str,
+        effective_from: str | None,
         chunk_ids: list[str],
         category: str | None = None,
         change_type: str | None = None,
@@ -83,11 +89,16 @@ class RegulationRegistry:
             "chunk_ids": list(chunk_ids),
             "category": category,
             "change_type": change_type,
-            "status": "detected",
+            "status": "pending",
         }
         self.state["versions"][version_id] = version
         self.state["regulations"][regulation_id]["versions"].append(version_id)
-        self._append_event("detected", version_id, {"source_path": source_path})
+        self._append_event(
+            "RegulationVersionDetected",
+            version_id,
+            {"source_path": source_path},
+            summary=f"{title} 새 버전 감지",
+        )
         self._persist()
         return copy.deepcopy(version)
 
@@ -103,16 +114,20 @@ class RegulationRegistry:
             raise ValueError(f"cannot approve version in {version['status']} status")
 
         version["effective_from"] = effective_from
-        current_day = _parse_iso_date(today or _today_iso())
+        current_day = _parse_iso_date(today or business_today_iso())
         effective_day = _parse_iso_date(effective_from)
         version["status"] = "scheduled" if effective_day > current_day else "approved"
 
-        self._recompute_effective_windows(version["regulation_id"], current_day)
+        transitions = self._recompute_effective_windows(version["regulation_id"], current_day)
+        self._record_status_transitions(transitions)
 
         self._append_event(
-            "approved",
+            "RegulationVersionScheduled" if version["status"] == "scheduled" else "RegulationVersionApproved",
             version_id,
-            {"actor": actor, "effective_from": effective_from, "status": version["status"]},
+            {"effective_from": effective_from, "status": version["status"]},
+            actor_role=actor,
+            actor_name=actor,
+            summary=f"{version['canonical_title']} 버전 {version['status']}",
         )
         self._persist()
         return copy.deepcopy(version)
@@ -125,7 +140,14 @@ class RegulationRegistry:
         version["status"] = "rejected"
         version["rejected_by"] = actor
         version["rejection_reason"] = reason
-        self._append_event("rejected", version_id, {"actor": actor, "reason": reason})
+        self._append_event(
+            "RegulationVersionRejected",
+            version_id,
+            {"reason": reason},
+            actor_role=actor,
+            actor_name=actor,
+            summary=f"{version['canonical_title']} 버전 반려",
+        )
         self._persist()
         return copy.deepcopy(version)
 
@@ -134,21 +156,32 @@ class RegulationRegistry:
             version = self._version_or_raise(version_id)
             version["indexed"] = True
             version["indexed_at"] = datetime.now(timezone.utc).isoformat()
-            self._append_event("RegulationVersionIndexed", version_id, {"version_id": version_id})
+            self._append_event(
+                "RegulationVersionIndexed",
+                version_id,
+                {"version_id": version_id},
+                summary=f"{version['canonical_title']} 검색 색인 완료",
+            )
         self._persist()
 
     def versions(self, as_of: str | None = None, include_history: bool = False) -> list[dict[str, Any]]:
+        current_day = business_today_iso()
+        if as_of is None or as_of == current_day:
+            self.refresh_statuses(today=current_day)
         if include_history:
             return [
                 copy.deepcopy(version)
                 for version in self._sorted_versions()
                 if version["status"] in {"approved", "scheduled", "superseded"}
+                and version.get("effective_from")
             ]
 
-        as_of_day = _parse_iso_date(as_of or _today_iso())
+        as_of_day = _parse_iso_date(as_of or current_day)
         allowed = []
         for version in self._sorted_versions():
             if version["status"] not in {"approved", "scheduled", "superseded"}:
+                continue
+            if not version.get("effective_from"):
                 continue
             effective_from = _parse_iso_date(version["effective_from"])
             effective_to = version.get("effective_to")
@@ -169,17 +202,37 @@ class RegulationRegistry:
         summary: str,
         metadata: dict[str, Any] | None = None,
         version_id: str | None = None,
+        actor_role: str = "system",
+        actor_name: str = "regulation-system",
+        target_type: str | None = None,
+        target_id: str | None = None,
+        result: str = "success",
     ) -> dict[str, Any]:
-        event = {
-            "event_id": uuid.uuid4().hex,
-            "event_type": event_type,
-            "version_id": version_id,
-            "summary": summary,
-            "metadata": copy.deepcopy(metadata or {}),
-        }
+        event = self._build_event(
+            event_type,
+            summary=summary,
+            metadata=metadata,
+            version_id=version_id,
+            actor_role=actor_role,
+            actor_name=actor_name,
+            target_type=target_type,
+            target_id=target_id,
+            result=result,
+        )
         self.state["events"].append(event)
         self._persist()
         return copy.deepcopy(event)
+
+    def refresh_statuses(self, today: str | None = None) -> int:
+        current_day = _parse_iso_date(today or business_today_iso())
+        transitions: list[tuple[dict[str, Any], str, str]] = []
+        for regulation_id in self.state["regulations"]:
+            transitions.extend(self._recompute_effective_windows(regulation_id, current_day))
+        if not transitions:
+            return 0
+        self._record_status_transitions(transitions)
+        self._persist()
+        return len(transitions)
 
     def scan_sources(self, paths, ingest, effective_date=None) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -270,14 +323,56 @@ class RegulationRegistry:
     def _persist(self) -> None:
         _write_json_atomic(self.path, self.state)
 
-    def _append_event(self, event_type: str, version_id: str, details: dict[str, Any]) -> None:
+    def _build_event(
+        self,
+        event_type: str,
+        *,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        version_id: str | None = None,
+        actor_role: str = "system",
+        actor_name: str = "regulation-registry",
+        target_type: str | None = None,
+        target_id: str | None = None,
+        result: str = "success",
+    ) -> dict[str, Any]:
+        resolved_target_type = target_type or ("regulation_version" if version_id else "system_action")
+        resolved_target_id = target_id or version_id or event_type
+        return {
+            "event_id": uuid.uuid4().hex,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "actor_role": actor_role,
+            "actor_name": actor_name,
+            "event_type": event_type,
+            "target_type": resolved_target_type,
+            "target_id": resolved_target_id,
+            "version_id": version_id,
+            "summary": summary,
+            "result": result,
+            "metadata": copy.deepcopy(metadata or {}),
+        }
+
+    def _append_event(
+        self,
+        event_type: str,
+        version_id: str,
+        details: dict[str, Any],
+        *,
+        actor_role: str = "system",
+        actor_name: str = "regulation-registry",
+        summary: str | None = None,
+        result: str = "success",
+    ) -> None:
         self.state["events"].append(
-            {
-                "event_id": uuid.uuid4().hex,
-                "event_type": event_type,
-                "version_id": version_id,
-                "details": details,
-            }
+            self._build_event(
+                event_type,
+                summary=summary or event_type,
+                metadata=details,
+                version_id=version_id,
+                actor_role=actor_role,
+                actor_name=actor_name,
+                result=result,
+            )
         )
 
     def _record_scanned_version(
@@ -285,7 +380,7 @@ class RegulationRegistry:
         canonical_title: str,
         source_path: str,
         content_hash: str,
-        effective_from: str,
+        effective_from: str | None,
         chunk_ids: list[str],
         status: str,
         change_type: str,
@@ -312,7 +407,12 @@ class RegulationRegistry:
         self.state["versions"][version_id] = version
         self.state["regulations"][regulation_id]["versions"].append(version_id)
         if append_detected_event:
-            self._append_event("detected", version_id, {"source_path": source_path, "change_type": change_type})
+            self._append_event(
+                "RegulationVersionDetected",
+                version_id,
+                {"source_path": source_path, "change_type": change_type},
+                summary=f"{canonical_title} 새 버전 감지",
+            )
         return version
 
     def _latest_version_for_title(self, canonical_title: str) -> dict[str, Any] | None:
@@ -325,7 +425,7 @@ class RegulationRegistry:
             return None
         return max(versions, key=lambda version: (version.get("effective_from") or "", version["version_id"]))
 
-    def _effective_date_for(self, path: Path, effective_date) -> str:
+    def _effective_date_for(self, path: Path, effective_date) -> str | None:
         if effective_date is None:
             return date_from_path(path)
         value = effective_date(path)
@@ -389,7 +489,13 @@ class RegulationRegistry:
             "version_id": version["version_id"],
             "retryable": True,
         }
-        self._append_event("RegulationVersionScanFailed", version["version_id"], error)
+        self._append_event(
+            "RegulationVersionScanFailed",
+            version["version_id"],
+            error,
+            summary=f"{title} 파일 처리 실패",
+            result="failure",
+        )
         return error
 
     def _find_duplicate(self, canonical_title: str, content_hash: str) -> dict[str, Any] | None:
@@ -422,15 +528,20 @@ class RegulationRegistry:
         version_ids = self.state["regulations"][regulation_id]["versions"]
         return [self.state["versions"][version_id] for version_id in version_ids]
 
-    def _recompute_effective_windows(self, regulation_id: str, current_day: date) -> None:
+    def _recompute_effective_windows(
+        self, regulation_id: str, current_day: date
+    ) -> list[tuple[dict[str, Any], str, str]]:
         versions = [
             version
             for version in self._versions_for_regulation(regulation_id)
             if version["status"] in {"approved", "scheduled", "superseded"}
+            and version.get("effective_from")
         ]
         versions.sort(key=lambda version: (_parse_iso_date(version["effective_from"]), version["version_id"]))
+        transitions = []
 
         for index, version in enumerate(versions):
+            previous_status = version["status"]
             effective_day = _parse_iso_date(version["effective_from"])
             next_version = versions[index + 1] if index + 1 < len(versions) else None
             next_effective_day = _parse_iso_date(next_version["effective_from"]) if next_version else None
@@ -444,19 +555,43 @@ class RegulationRegistry:
                 version["status"] = "superseded"
             else:
                 version["status"] = "approved"
+            if version["status"] != previous_status:
+                transitions.append((version, previous_status, version["status"]))
+        return transitions
+
+    def _record_status_transitions(self, transitions: list[tuple[dict[str, Any], str, str]]) -> None:
+        for version, previous_status, current_status in transitions:
+            if current_status == "superseded":
+                event_type = "RegulationVersionSuperseded"
+                summary = f"{version['canonical_title']} 이전 버전 종료"
+            elif previous_status == "scheduled" and current_status == "approved":
+                event_type = "ScheduledVersionActivated"
+                summary = f"{version['canonical_title']} 예약 버전 시행"
+            else:
+                continue
+            self._append_event(
+                event_type,
+                version["version_id"],
+                {"previous_status": previous_status, "status": current_status},
+                summary=summary,
+            )
 
     def _sorted_versions(self) -> list[dict[str, Any]]:
         return sorted(
             self.state["versions"].values(),
-            key=lambda version: (version["canonical_title"], version["effective_from"], version["version_id"]),
+            key=lambda version: (
+                version["canonical_title"],
+                version.get("effective_from") or "",
+                version["version_id"],
+            ),
         )
 
 
-def date_from_path(path: Path) -> str:
+def date_from_path(path: Path) -> str | None:
     match = re.search(r"(20\d{2})[.\-년]\s*(\d{1,2})[.\-월]\s*(\d{1,2})", path.name)
     if not match:
-        return _today_iso()
+        return None
     try:
         return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
     except ValueError:
-        return _today_iso()
+        return None

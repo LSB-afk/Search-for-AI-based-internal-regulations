@@ -1,9 +1,10 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from regulation_registry import RegulationRegistry
+from regulation_registry import RegulationRegistry, business_today_iso, date_from_path
 
 
 class RegulationRegistryTest(unittest.TestCase):
@@ -38,6 +39,61 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual({item["status"] for item in history}, {"approved", "superseded"})
         old_version = next(item for item in history if item["version_id"] == old["version_id"])
         self.assertEqual(old_version["effective_to"], "2026-05-26")
+
+    def test_business_day_uses_korea_timezone_at_utc_boundary(self):
+        utc_time = datetime(2026, 7, 12, 15, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(business_today_iso(utc_time), "2026-07-13")
+
+    def test_missing_effective_date_stays_pending_and_is_not_current(self):
+        source = Path(self.tmp.name) / "시행일없는규정.hwp"
+        source.write_bytes(b"undated")
+
+        result = self.registry.scan_sources(
+            [source],
+            lambda path: [{"id": "undated-chunk", "text": "시행일 확인 필요"}],
+            effective_date=lambda path: None,
+        )
+
+        version = next(iter(self.registry.state["versions"].values()))
+        self.assertIsNone(date_from_path(source))
+        self.assertIsNone(version["effective_from"])
+        self.assertEqual(version["status"], "pending")
+        self.assertEqual(result["chunks"][0]["version_status"], "pending")
+        self.assertEqual(self.registry.versions(as_of="2026-07-13"), [])
+
+    def test_audit_events_use_normalized_schema_and_transition_names(self):
+        old = self.registry.record_detection("인사규정", "/closed/old.hwp", "old", "2025-01-01", ["old"])
+        self.registry.approve_version(old["version_id"], "감사팀장", "2025-01-01", today="2026-07-13")
+        new = self.registry.record_detection("인사규정", "/closed/new.hwp", "new", "2026-01-01", ["new"])
+        self.registry.approve_version(new["version_id"], "감사팀장", "2026-01-01", today="2026-07-13")
+        rejected = self.registry.record_detection("복무규정", "/closed/rejected.hwp", "rejected", None, [])
+        self.registry.reject_version(rejected["version_id"], "감사팀장", "시행일 미상")
+        scheduled = self.registry.record_detection("감사규정", "/closed/future.hwp", "future", "2027-01-01", [])
+        self.registry.approve_version(
+            scheduled["version_id"], "감사팀장", "2027-01-01", today="2026-07-13"
+        )
+        self.registry.refresh_statuses(today="2027-01-01")
+
+        events = self.registry.events(100)
+        event_types = {event["event_type"] for event in events}
+        self.assertTrue(
+            {
+                "RegulationVersionDetected",
+                "RegulationVersionApproved",
+                "RegulationVersionScheduled",
+                "RegulationVersionRejected",
+                "RegulationVersionSuperseded",
+                "ScheduledVersionActivated",
+            }.issubset(event_types)
+        )
+        for event in events:
+            self.assertTrue(event["occurred_at"])
+            self.assertIn("actor_role", event)
+            self.assertIn("actor_name", event)
+            self.assertEqual(event["target_type"], "regulation_version")
+            self.assertTrue(event["target_id"])
+            self.assertTrue(event["result"])
 
     def test_historical_approval_after_current_version_closes_old_window(self):
         new = self.registry.record_detection(
@@ -181,7 +237,7 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual(result["errors"][0]["error"], "broken parser")
         self.assertEqual(
             [event["event_type"] for event in self.registry.events()],
-            ["detected", "RegulationVersionScanFailed"],
+            ["RegulationVersionDetected", "RegulationVersionScanFailed"],
         )
         error_versions = [
             version for version in self.registry.state["versions"].values() if version["status"] == "scan_error"
@@ -240,7 +296,7 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual(scan_statuses, ["error", "new"])
         self.assertEqual(
             [event["event_type"] for event in self.registry.events()],
-            ["RegulationVersionScanFailed", "detected"],
+            ["RegulationVersionScanFailed", "RegulationVersionDetected"],
         )
 
     def test_dictionary_chunks_retry_until_indexed_acknowledged(self):

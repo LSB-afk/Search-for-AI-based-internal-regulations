@@ -952,6 +952,18 @@ textarea {
   vertical-align: top;
 }
 
+.audit-events th:nth-child(1) {
+  width: 36%;
+}
+
+.audit-events th:nth-child(2) {
+  width: 34%;
+}
+
+.audit-events th:nth-child(3) {
+  width: 30%;
+}
+
 .toast {
   position: fixed;
   left: 50%;

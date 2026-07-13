@@ -1,8 +1,8 @@
 import json
 import tempfile
+import time
 import unittest
 from hashlib import sha256
-from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -26,6 +26,7 @@ class IsolatedServerTest(unittest.TestCase):
             mock.patch.object(server, "INDEX_FILE", self.index_file),
             mock.patch.object(server, "REGISTRY", self.registry),
             mock.patch.object(server, "configured_source_roots", lambda: [Path(self.tmp.name).resolve()]),
+            mock.patch.object(server, "demo_mutations_enabled", lambda: True),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -174,7 +175,7 @@ class SearchVersionFilterTest(IsolatedServerTest):
 
         result = server.search_index("징계 기준", "employee", None, include_history=True)
 
-        self.assertEqual(result["as_of"], date.today().isoformat())
+        self.assertEqual(result["as_of"], server.business_today_iso())
         self.assertEqual([item["version_id"] for item in result["results"]], [current["version_id"]])
 
     def test_search_index_uses_query_detected_basis_date_for_version_filter(self):
@@ -271,6 +272,15 @@ class ApiRoutesTest(IsolatedServerTest):
                 return response.status, json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def wait_for_event(self, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events = self.registry.events(1)
+            if events:
+                return events[0]
+            time.sleep(0.01)
+        self.fail("audit event was not recorded before timeout")
 
     def test_dashboard_versions_and_events_return_registry_state(self):
         pending = self.registry.record_detection("인사규정", "/closed/new.hwp", "hash", "2026-05-27", ["c"])
@@ -369,6 +379,35 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual(unknown_status, 404)
         self.assertIn("version_id", unknown_body["error"])
 
+    def test_mutation_routes_are_disabled_without_explicit_demo_flag(self):
+        version = self.registry.record_detection("인사규정", "/closed/new.hwp", "hash", "2026-05-27", ["c"])
+
+        with mock.patch.object(server, "demo_mutations_enabled", return_value=False):
+            status, body = self.post_json(
+                "/api/versions/approve",
+                {"version_id": version["version_id"], "effective_from": "2026-05-27"},
+            )
+
+        self.assertEqual(status, 403)
+        self.assertIn("disabled", body["error"])
+
+    def test_cors_is_emitted_only_for_explicitly_allowed_origin(self):
+        blocked_request = Request(self.base_url + "/api/health", headers={"Origin": "https://evil.example"})
+        allowed_request = Request(
+            self.base_url + "/api/health",
+            headers={
+                "Origin": "https://lsb-afk.github.io",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+
+        with mock.patch.object(server, "allowed_cors_origins", return_value={"https://lsb-afk.github.io"}):
+            with urlopen(blocked_request, timeout=5) as response:
+                self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+            with urlopen(allowed_request, timeout=5) as response:
+                self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "https://lsb-afk.github.io")
+                self.assertEqual(response.headers.get("Access-Control-Allow-Private-Network"), "true")
+
     def test_search_route_validates_malformed_as_of_and_accepts_include_history(self):
         status, body = self.post_json("/api/search", {"query": "징계", "as_of": "2026-99-99"})
 
@@ -393,7 +432,7 @@ class ApiRoutesTest(IsolatedServerTest):
 
         self.assertEqual(status, 200)
         self.assertIn("results", body)
-        event = self.registry.events(1)[0]
+        event = self.wait_for_event()
         event_json = json.dumps(event, ensure_ascii=False)
         self.assertEqual(event["event_type"], "SearchExecuted")
         self.assertNotIn("개인정보가 포함될 수 있는 긴 질의", event_json)
@@ -420,7 +459,7 @@ class ApiRoutesTest(IsolatedServerTest):
             body = response.read()
 
         self.assertEqual(body, b"private source bytes")
-        event = self.registry.events(1)[0]
+        event = self.wait_for_event()
         event_json = json.dumps(event, ensure_ascii=False)
         self.assertEqual(event["event_type"], "SourceDownloaded")
         self.assertEqual(event["metadata"]["source_file"], source.name)
@@ -665,7 +704,7 @@ class ApiRoutesTest(IsolatedServerTest):
             body = response.read()
 
         self.assertEqual(body, b"%PDF private source bytes")
-        event = self.registry.events(1)[0]
+        event = self.wait_for_event()
         event_json = json.dumps(event, ensure_ascii=False)
         self.assertEqual(event["event_type"], "SourceDownloaded")
         self.assertEqual(event["metadata"]["source_file"], source.name)

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from regulation_registry import RegulationRegistry
+from regulation_registry import RegulationRegistry, business_today_iso
 
 try:
     import pdfplumber  # type: ignore
@@ -81,6 +81,37 @@ STOPWORDS = {
 }
 
 REGISTRY = RegulationRegistry(REGISTRY_FILE)
+MUTATION_PATHS = {
+    "/api/versions/approve",
+    "/api/versions/reject",
+    "/api/upload",
+    "/api/ingest-local",
+    "/api/reset",
+}
+
+
+def allowed_cors_origins() -> set[str]:
+    return {
+        origin.strip().rstrip("/")
+        for origin in os.environ.get("REG_RAG_ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    }
+
+
+def demo_mutations_enabled() -> bool:
+    return os.environ.get("REG_RAG_ENABLE_DEMO_MUTATIONS") == "1"
+
+
+def add_api_cors_headers(handler: BaseHTTPRequestHandler) -> None:
+    origin = handler.headers.get("Origin")
+    if not origin or origin.rstrip("/") not in allowed_cors_origins():
+        return
+    handler.send_header("Access-Control-Allow-Origin", origin)
+    handler.send_header("Vary", "Origin")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    if handler.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+        handler.send_header("Access-Control-Allow-Private-Network", "true")
 
 
 def configured_source_roots() -> list[Path]:
@@ -615,7 +646,7 @@ def search_index(
 ) -> dict[str, Any]:
     payload = load_index()
     chunks = payload.get("chunks", [])
-    effective_search_date = detect_date(query, as_of) or date.today().isoformat()
+    effective_search_date = detect_date(query, as_of) or business_today_iso()
     allowed_versions = REGISTRY.versions(effective_search_date, include_history=include_history)
     allowed_version_ids = {
         version["version_id"] for version in allowed_versions if version_is_effective(version, effective_search_date)
@@ -1031,10 +1062,7 @@ def send_bytes(
 ) -> None:
     encoded_name = quote(filename)
     handler.send_response(HTTPStatus.OK)
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Private-Network", "true")
+    add_api_cors_headers(handler)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(data)))
     handler.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded_name}")
@@ -1060,6 +1088,9 @@ def record_source_download_event(chunk: dict[str, Any], event_type: str, outcome
         summary=payload["summary"],
         metadata=payload["metadata"],
         version_id=chunk.get("version_id"),
+        target_type="regulation_version" if chunk.get("version_id") else "document_chunk",
+        target_id=chunk.get("version_id") or chunk.get("id"),
+        result="success" if outcome == "success" else "failure",
     )
 
 
@@ -1076,6 +1107,9 @@ def record_missing_source_download_event(requested_id: str) -> None:
             "requested_id_sha256": hashlib.sha256(requested_id_bytes).hexdigest(),
             "requested_id_format_valid": bool(re.fullmatch(r"[0-9a-f]{12}", requested_id)),
         },
+        target_type="document_chunk",
+        target_id=hashlib.sha256(requested_id_bytes).hexdigest(),
+        result="failure",
     )
 
 
@@ -1528,10 +1562,7 @@ def bounded_limit(raw_value: str | None, default: int = 100, maximum: int = 500)
 def json_response(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Private-Network", "true")
+    add_api_cors_headers(handler)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -1575,10 +1606,7 @@ class RegRagHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
+        add_api_cors_headers(self)
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
@@ -1676,6 +1704,9 @@ class RegRagHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path in MUTATION_PATHS and not demo_mutations_enabled():
+                json_response(self, HTTPStatus.FORBIDDEN, operation_error("demo mutations disabled"))
+                return
             if path == "/api/search":
                 body = self.read_json_body()
                 try:
@@ -1696,7 +1727,15 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     result["as_of"],
                     len(result["results"]),
                 )
-                REGISTRY.record_event("SearchExecuted", summary=payload["summary"], metadata=payload["metadata"])
+                REGISTRY.record_event(
+                    "SearchExecuted",
+                    summary=payload["summary"],
+                    metadata=payload["metadata"],
+                    actor_role=result["role"],
+                    actor_name="search-user",
+                    target_type="regulation_search",
+                    target_id="search",
+                )
                 json_response(self, HTTPStatus.OK, result)
                 return
             if path == "/api/versions/approve":
