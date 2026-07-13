@@ -1588,6 +1588,16 @@ def static_response(handler: BaseHTTPRequestHandler, path: Path) -> None:
     handler.wfile.write(data)
 
 
+def static_asset_path(request_path: str) -> Path | None:
+    if not request_path.startswith("/static/"):
+        return None
+    static_root = STATIC_DIR.resolve()
+    candidate = (static_root / request_path.removeprefix("/static/")).resolve()
+    if candidate == static_root or static_root not in candidate.parents:
+        return None
+    return candidate
+
+
 class RegRagHandler(BaseHTTPRequestHandler):
     server_version = "RegRAGPrototype/0.1"
 
@@ -1616,7 +1626,11 @@ class RegRagHandler(BaseHTTPRequestHandler):
             static_response(self, STATIC_DIR / "index.html")
             return
         if path.startswith("/static/"):
-            static_response(self, STATIC_DIR / path.replace("/static/", "", 1))
+            asset_path = static_asset_path(path)
+            if asset_path is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            static_response(self, asset_path)
             return
         if path == "/api/health":
             json_response(

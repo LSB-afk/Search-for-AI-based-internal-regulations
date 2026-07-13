@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from hashlib import sha256
+from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -247,6 +248,15 @@ class ApiRoutesTest(IsolatedServerTest):
         except HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
+    def raw_get(self, path):
+        connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=5)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
     def post_json(self, path, body):
         request = Request(
             self.base_url + path,
@@ -334,6 +344,28 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertNotIn("source_path", serialized)
         self.assertNotIn(private_path, serialized)
         self.assertIn("인사규정.hwpx", serialized)
+
+    def test_static_routes_reject_plain_and_encoded_path_traversal(self):
+        static_dir = Path(self.tmp.name) / "static"
+        static_dir.mkdir()
+        (static_dir / "app.js").write_text("console.log('safe')", encoding="utf-8")
+        self.write_chunks([{"text": "private regulation", "source_path": "/srv/private/rule.hwp"}])
+        (Path(self.tmp.name) / "server.py").write_text("PRIVATE_SERVER_SOURCE", encoding="utf-8")
+
+        with mock.patch.object(server, "STATIC_DIR", static_dir):
+            safe_status, safe_body = self.raw_get("/static/app.js")
+            blocked = [
+                self.raw_get("/static/../data/index.json"),
+                self.raw_get("/static/%2e%2e/data/index.json"),
+                self.raw_get("/static/../server.py"),
+            ]
+
+        self.assertEqual(safe_status, 200)
+        self.assertIn(b"safe", safe_body)
+        for status, body in blocked:
+            self.assertEqual(status, 404)
+            self.assertNotIn(b"private regulation", body)
+            self.assertNotIn(b"PRIVATE_SERVER_SOURCE", body)
 
     def test_events_rejects_limit_below_one(self):
         self.registry.record_detection("인사규정", "/closed/one.hwp", "hash-one", "2026-05-27", ["c1"])
