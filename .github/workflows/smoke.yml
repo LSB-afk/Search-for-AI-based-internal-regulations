@@ -23,13 +23,22 @@ jobs:
           python server.py --host 127.0.0.1 --port 8765 &
           server_pid=$!
           trap "kill $server_pid" EXIT
-          sleep 2
           python - <<'PY'
           import json
+          import time
           import urllib.request
+          from urllib.error import URLError
 
-          with urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=10) as resp:
-              payload = json.loads(resp.read().decode("utf-8"))
+          deadline = time.monotonic() + 20
+          while True:
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=2) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+                  break
+              except URLError:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(0.25)
           assert payload["ok"] is True
           assert payload["chunks"] >= 1
           with urllib.request.urlopen("http://127.0.0.1:8765/api/dashboard", timeout=10) as resp:

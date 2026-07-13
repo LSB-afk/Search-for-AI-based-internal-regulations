@@ -155,6 +155,11 @@ class ProductShellStaticTest(unittest.TestCase):
         self.assertNotIn("item.download", restricted_markup)
         self.assertNotIn("download-button", restricted_markup)
 
+    def test_browser_uses_opaque_download_urls_without_source_paths(self):
+        self.assertNotIn("item.source_path", JS)
+        self.assertNotIn("version.source_path", JS)
+        self.assertIn("item.download", JS)
+
     def test_operations_refresh_clears_stale_versions_and_events_on_failure(self):
         catch_branch = re.search(
             r"async function refreshOperations\(\).*?catch\s*\(error\)\s*\{(?P<branch>.*?)\n\s*\}\n\s*renderSyncRail\(\);",

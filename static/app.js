@@ -472,7 +472,7 @@ function renderUpdatesView() {
             <article class="review-row">
               <div class="operation-main">
                 <strong>${escapeHtml(versionTitle(version))}</strong>
-                <span>${escapeHtml(version.source_path || "원본 경로 미상")}</span>
+                <span>${escapeHtml(version.source_file || "원본 파일 미상")}</span>
               </div>
               <span class="status-pill ${escapeHtml(version.status || "")}">${escapeHtml(versionStatusLabel(version))}</span>
               ${controls}
@@ -490,7 +490,7 @@ function renderUpdatesView() {
               <article class="operation-row">
                 <div class="operation-main">
                   <strong>${escapeHtml(versionTitle(version))}</strong>
-                  <span>${escapeHtml(version.source_path || "오류 원본 미상")}</span>
+                  <span>${escapeHtml(version.source_file || "오류 원본 미상")}</span>
                 </div>
                 <span class="status-pill scan_error">오류</span>
               </article>
@@ -842,8 +842,8 @@ function renderResults(payload) {
     .map((item) => {
       const period = [item.effective_from || "시행일 미상", item.effective_to || ""].filter(Boolean).join(" ~ ");
       const page = item.page ? `p.${item.page}` : "page 없음";
-      const sourceHref = item.download && item.source_path ? apiUrl(item.download.source) : "";
-      const sourcePdfHref = item.download && item.source_path ? apiUrl(item.download.source_pdf) : "";
+      const sourceHref = item.download?.source ? apiUrl(item.download.source) : "";
+      const sourcePdfHref = item.download?.source_pdf ? apiUrl(item.download.source_pdf) : "";
       if (isRestrictedResult(item)) {
         return `
           <article class="result-card restricted-result">

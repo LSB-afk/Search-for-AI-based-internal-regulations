@@ -572,17 +572,20 @@ def search_chunks(
                 score += 1.5
         if SENSITIVE_QUERY_TERMS.intersection(query_terms) and not SENSITIVE_MATCH_TERMS.intersection(matched):
             continue
+        download = None
+        if chunk.get("source_path"):
+            download = {
+                "source": f"/api/download/source?id={chunk.get('id')}",
+                "source_pdf": f"/api/download/source-pdf?id={chunk.get('id')}",
+            }
         scored.append(
             {
-                **{k: v for k, v in chunk.items() if k != "tokens"},
+                **{k: v for k, v in chunk.items() if k not in {"tokens", "source_path"}},
                 "score": round(score, 4),
                 "matched_terms": matched,
                 "snippet": make_snippet(chunk.get("text", ""), matched or query_terms),
                 "summary": summarize_text(chunk.get("text", ""), matched or query_terms),
-                "download": {
-                    "source": f"/api/download/source?id={chunk.get('id')}",
-                    "source_pdf": f"/api/download/source-pdf?id={chunk.get('id')}",
-                },
+                "download": download,
             }
         )
 
@@ -981,8 +984,9 @@ def ingest_local_sources() -> dict[str, Any]:
         ingest=lambda path: ingest_file(path),
         effective_date=lambda path: date_from_text(path.name),
     )
-    if result["chunks"]:
-        chunks = result.pop("chunks")
+    chunks = result.pop("chunks")
+    result["imported_chunks"] = len(chunks)
+    if chunks:
         add_chunks(chunks)
         REGISTRY.mark_versions_indexed(sorted({chunk["version_id"] for chunk in chunks if chunk.get("version_id")}))
     result["documents"] = document_summary()
@@ -1448,6 +1452,34 @@ def operation_error(message: str) -> dict[str, str]:
     return {"error": message}
 
 
+def redact_source_paths(value: Any) -> Any:
+    if isinstance(value, list):
+        return [redact_source_paths(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    redacted: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "source_path":
+            if item and not value.get("source_file"):
+                redacted["source_file"] = Path(str(item)).name
+            continue
+        redacted[key] = redact_source_paths(item)
+    return redacted
+
+
+def public_version(version: dict[str, Any]) -> dict[str, Any]:
+    return redact_source_paths(version)
+
+
+def public_event(event: dict[str, Any]) -> dict[str, Any]:
+    return redact_source_paths(event)
+
+
+def public_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    return {k: redact_source_paths(v) for k, v in chunk.items() if k not in {"tokens", "source_path"}}
+
+
 def dashboard_payload() -> dict[str, Any]:
     versions = list(REGISTRY.state.get("versions", {}).values())
     current_count = len(REGISTRY.versions(None, include_history=False))
@@ -1459,7 +1491,7 @@ def dashboard_payload() -> dict[str, Any]:
         "current_count": current_count,
         "pending_count": pending_count,
         "error_count": error_count,
-        "last_scan": scan_runs[-1] if scan_runs else None,
+        "last_scan": redact_source_paths(scan_runs[-1]) if scan_runs else None,
         "offline": True,
     }
 
@@ -1476,7 +1508,7 @@ def versions_payload(status: str | None = None, regulation_id: str | None = None
                     continue
             elif version_status != status:
                 continue
-        versions.append({**version})
+        versions.append(public_version(version))
     versions.sort(key=lambda item: (item.get("canonical_title", ""), item.get("effective_from", ""), item["version_id"]))
     return {"versions": versions}
 
@@ -1588,12 +1620,12 @@ class RegRagHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
                 return
-            json_response(self, HTTPStatus.OK, {"events": REGISTRY.events(limit)})
+            json_response(self, HTTPStatus.OK, {"events": [public_event(event) for event in REGISTRY.events(limit)]})
             return
         if path == "/api/chunks":
             qs = parse_qs(parsed.query)
             limit = int((qs.get("limit") or ["25"])[0])
-            chunks = [{k: v for k, v in c.items() if k != "tokens"} for c in load_index().get("chunks", [])[:limit]]
+            chunks = [public_chunk(chunk) for chunk in load_index().get("chunks", [])[:limit]]
             json_response(self, HTTPStatus.OK, {"chunks": chunks})
             return
         if path == "/api/download/source":
@@ -1687,7 +1719,7 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
                     return
-                json_response(self, HTTPStatus.OK, {"version": version, "simulation": True})
+                json_response(self, HTTPStatus.OK, {"version": public_version(version), "simulation": True})
                 return
             if path == "/api/versions/reject":
                 body = self.read_json_body()
@@ -1708,7 +1740,7 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     json_response(self, HTTPStatus.BAD_REQUEST, operation_error(str(exc)))
                     return
-                json_response(self, HTTPStatus.OK, {"version": version, "simulation": True})
+                json_response(self, HTTPStatus.OK, {"version": public_version(version), "simulation": True})
                 return
             if path == "/api/upload":
                 body = self.read_json_body()
@@ -1723,7 +1755,7 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.OK, {"imported_chunks": count, "documents": document_summary()})
                 return
             if path == "/api/ingest-local":
-                json_response(self, HTTPStatus.OK, ingest_local_sources())
+                json_response(self, HTTPStatus.OK, redact_source_paths(ingest_local_sources()))
                 return
             if path == "/api/reset":
                 seed_index(force=True)

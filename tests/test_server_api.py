@@ -82,6 +82,25 @@ class SearchVersionFilterTest(IsolatedServerTest):
 
         self.assertEqual([item["version_id"] for item in result["results"]], ["new"])
 
+    def test_search_results_use_opaque_download_links_without_source_paths(self):
+        private_path = "/srv/cheonan/regulations/인사규정.hwpx"
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="징계",
+            text="징계 처리 기준",
+            source_file="인사규정.hwpx",
+            source_type="hwpx",
+            source_path=private_path,
+        )
+
+        result = server.search_chunks([chunk], "징계", "employee", "2026-07-12", 6)
+
+        item = result["results"][0]
+        self.assertNotIn("source_path", item)
+        self.assertNotIn(private_path, json.dumps(result, ensure_ascii=False))
+        self.assertEqual(item["download"]["source"], f"/api/download/source?id={chunk['id']}")
+        self.assertEqual(item["download"]["source_pdf"], f"/api/download/source-pdf?id={chunk['id']}")
+
     def test_search_index_uses_latest_approved_version_by_default(self):
         old = self.registry.record_detection("인사규정", "/closed/old.hwp", "old-hash", "2025-01-01", ["old-c"])
         self.registry.approve_version(old["version_id"], "감사팀장", "2025-01-01", today="2026-07-12")
@@ -269,6 +288,42 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual([item["version_id"] for item in versions["versions"]], [pending["version_id"]])
         self.assertEqual(events_status, 200)
         self.assertEqual(len(events["events"]), 1)
+
+    def test_public_read_apis_do_not_expose_internal_source_paths(self):
+        private_path = "/srv/cheonan/regulations/인사규정.hwpx"
+        version = self.registry.record_detection("인사규정", private_path, "hash", "2026-05-27", ["c"])
+        self.registry.state["scan_runs"].append(
+            {
+                "scan_run_id": "scan-private",
+                "started_at": "2026-07-13T00:00:00+00:00",
+                "finished_at": "2026-07-13T00:00:01+00:00",
+                "new_count": 1,
+                "changed_count": 0,
+                "unchanged_count": 0,
+                "error_count": 0,
+                "sources": [{"source_path": private_path, "version_id": version["version_id"]}],
+            }
+        )
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="본문",
+            text="징계 처리 기준",
+            source_file="인사규정.hwpx",
+            source_type="hwpx",
+            source_path=private_path,
+        )
+        self.write_chunks([chunk])
+
+        payloads = []
+        for path in ("/api/dashboard", "/api/versions", "/api/events", "/api/chunks"):
+            status, payload = self.get_json(path)
+            self.assertEqual(status, 200)
+            payloads.append(payload)
+
+        serialized = json.dumps(payloads, ensure_ascii=False)
+        self.assertNotIn("source_path", serialized)
+        self.assertNotIn(private_path, serialized)
+        self.assertIn("인사규정.hwpx", serialized)
 
     def test_events_rejects_limit_below_one(self):
         self.registry.record_detection("인사규정", "/closed/one.hwp", "hash-one", "2026-05-27", ["c1"])

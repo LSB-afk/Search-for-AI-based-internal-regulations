@@ -25,10 +25,10 @@ python3 server.py
 python3 -m unittest discover -s tests -v
 python3 -m py_compile regulation_registry.py server.py
 node --check static/app.js
-python3 server.py --host 127.0.0.1 --port 8765
-# 별도 터미널
 python3 tests/e2e_smoke.py
 ```
+
+E2E는 임시 앱 복사본과 합성 HWPX 규정을 만들고, 사용 가능한 로컬 포트에서 서버를 직접 시작한 뒤 종료합니다. 기존 서버를 점검할 때만 `REG_RAG_BASE_URL=http://127.0.0.1:8765`를 지정합니다.
 
 ## 폐쇄망 내부 서버 배포
 
@@ -90,7 +90,7 @@ python3 server.py --ingest-local
 규정 폴더가 앱 폴더 밖에 있으면 `REG_RAG_SOURCE_DIRS`에 지정합니다.
 
 ```bash
-REG_RAG_SOURCE_DIRS="/path/to/(붙임1) 정관 및 규정(기준일 2026.5.27.)" \
+REG_RAG_SOURCE_DIRS="/path/to/regulations" \
 REG_RAG_AUTO_INGEST=1 \
 python3 server.py --host 0.0.0.0 --port 8765
 ```
