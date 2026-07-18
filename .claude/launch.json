@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "reg-rag-server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["server.py"],
+      "port": 8765
+    }
+  ]
+}
