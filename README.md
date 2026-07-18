@@ -46,6 +46,7 @@ E2E는 임시 앱 복사본과 합성 HWPX 규정을 만들고, 사용 가능한
 python3 -m pip install --no-index --find-links ./wheelhouse -r requirements.txt
 REG_RAG_SOURCE_DIRS="/srv/cheonan/regulations" \
 REG_RAG_AUTO_INGEST=1 \
+REG_RAG_AUTO_INGEST_INTERVAL_SECONDS=60 \
 python3 server.py --host 0.0.0.0 --port 8765
 ```
 
@@ -53,8 +54,11 @@ python3 server.py --host 0.0.0.0 --port 8765
 
 - `/srv/cheonan/regulations`: 내부 규정 HWP/HWPX/PDF 원문을 읽기 전용으로 마운트합니다.
 - `REG_RAG_SOURCE_DIRS`: 자동 색인 대상 폴더를 지정합니다. 여러 경로는 macOS/Linux 기준 `:`로 구분합니다.
-- `REG_RAG_AUTO_INGEST=1`: 서버 시작 시 지정 폴더를 스캔하고 색인을 갱신합니다.
+- `REG_RAG_AUTO_INGEST=1`: 서버 시작 시 최초 스캔을 실행하고 서버 운영 중에도 주기적으로 규정 폴더를 다시 검사합니다.
+- `REG_RAG_AUTO_INGEST_INTERVAL_SECONDS=60`: 자동 스캔 주기입니다. 운영 환경에서는 10초 이상의 정수를 사용합니다.
+- 새 파일과 변경 파일은 자동으로 색인되지만 `검토 대기`로 등록되며, 감사팀장 승인 전에는 현재 검색·다운로드 결과를 변경하지 않습니다.
 - `data/index.json`: 서버 로컬에서 생성되는 색인 파일이며 저장소에 커밋하지 않습니다.
+- `data/index.json`과 `data/regulation_registry.json`은 하나의 서버 프로세스만 기록해야 합니다. 같은 데이터 폴더에 서버(컨테이너)를 두 개 이상 띄우지 않습니다.
 
 Docker로 내부 서버를 실행할 때도 원문 폴더는 읽기 전용 볼륨으로 붙입니다.
 
@@ -63,6 +67,7 @@ docker build -t internal-reg-rag .
 docker run --rm -p 8765:8765 \
   -e REG_RAG_SOURCE_DIRS=/sources \
   -e REG_RAG_AUTO_INGEST=1 \
+  -e REG_RAG_AUTO_INGEST_INTERVAL_SECONDS=60 \
   -v "/srv/cheonan/regulations":/sources:ro \
   internal-reg-rag
 ```
