@@ -377,6 +377,18 @@ function formatScanTime(scan) {
   });
 }
 
+function autoIngestState(autoIngest) {
+  if (!autoIngest?.enabled) return "사용 안 함";
+  if (autoIngest.running) return "스캔 중";
+  return "대기";
+}
+
+function autoIngestResult(autoIngest) {
+  const result = autoIngest?.last_result;
+  if (!result) return "실행 기록 없음";
+  return `신규 ${Number(result.new_count || 0)} · 변경 ${Number(result.changed_count || 0)} · 오류 ${Number(result.error_count || 0)}`;
+}
+
 function roleViews() {
   return ROLE_VIEWS[state.actorRole] || ROLE_VIEWS.employee;
 }
@@ -608,6 +620,12 @@ function renderOperationsView() {
   const lastScan = formatScanTime(dashboard.last_scan);
   const currentCount = String(dashboard.current_count ?? regs.length);
   const totalRegulations = String(dashboard.total_regulations ?? regs.length);
+  const autoIngest = dashboard.auto_ingest || {};
+  const interval = autoIngest.enabled ? `${Number(autoIngest.interval_seconds || 0)}초` : "설정 없음";
+  const nextRun = autoIngest.next_run_at
+    ? formatScanTime({ finished_at: autoIngest.next_run_at })
+    : "예정 없음";
+  const lastError = autoIngest.last_error?.message || "없음";
   const events = [...state.localEvents, ...state.events].slice(0, 100);
   const eventRows = events.length
     ? events
@@ -631,6 +649,11 @@ function renderOperationsView() {
       statusCard("오류", `${errorCount}건`, "스캔 실패 또는 원본 확인 필요"),
       statusCard("마지막 스캔", lastScan, "폐쇄망 폴더 기준"),
       statusCard("검색 서버", state.lastHealth ? `${state.lastHealth.chunks} chunks` : "연결 확인 중", "로컬 API 상태"),
+      statusCard("자동 갱신", autoIngestState(autoIngest), autoIngest.running ? "규정 폴더 검사 중" : "승인 전 검토 대기 등록"),
+      statusCard("갱신 주기", interval, "환경변수 설정"),
+      statusCard("다음 스캔", nextRun, "폐쇄망 폴더 기준"),
+      statusCard("최근 자동 결과", autoIngestResult(autoIngest), "신규·변경·오류"),
+      statusCard("최근 갱신 오류", lastError, "오류 후 다음 주기 재시도"),
     ].join("")}
     <section class="audit-events">
       <h3>감사 이벤트</h3>

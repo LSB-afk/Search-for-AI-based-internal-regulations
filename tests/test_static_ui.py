@@ -211,6 +211,18 @@ class ProductShellStaticTest(unittest.TestCase):
             with self.subTest(metric=metric):
                 self.assertIn(metric, JS)
 
+    def test_operations_view_surfaces_automatic_ingest_status(self):
+        self.assertIn("dashboard.auto_ingest", JS)
+        self.assertIn("자동 갱신", JS)
+        self.assertIn("갱신 주기", JS)
+        self.assertIn("다음 스캔", JS)
+        self.assertIn("최근 자동 결과", JS)
+        self.assertIn("최근 갱신 오류", JS)
+        self.assertIn("interval_seconds", JS)
+        self.assertIn("next_run_at", JS)
+        self.assertIn("last_result", JS)
+        self.assertIn("last_error", JS)
+
     def test_long_names_and_mobile_controls_wrap_without_overlap(self):
         for marker in ("overflow-wrap: anywhere", "min-width: 0", "grid-template-columns: 1fr"):
             with self.subTest(marker=marker):
