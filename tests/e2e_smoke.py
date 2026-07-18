@@ -47,12 +47,12 @@ def available_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def create_synthetic_hwpx(path: Path) -> None:
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
+def create_synthetic_hwpx(path: Path, revision_label: str) -> None:
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <section>
-  <text>제1조 징계 규정의 최신 근거 조항</text>
+  <text>제1조 징계 규정의 {revision_label} 근거 조항</text>
   <text>합성 규정 원본은 브라우저 다운로드 검증에만 사용한다.</text>
-  <text>감사팀장은 최신 규정의 시행일과 근거 조항을 확인한다.</text>
+  <text>감사팀장은 {revision_label} 규정의 시행일과 근거 조항을 확인한다.</text>
 </section>
 """
     with zipfile.ZipFile(path, "w") as archive:
@@ -67,7 +67,7 @@ def approve_pending_versions(base_url: str) -> None:
         body = json.dumps(
             {
                 "version_id": version["version_id"],
-                "effective_from": "2026-05-27",
+                "effective_from": version["effective_from"],
                 "actor": "E2E 감사팀장",
             }
         ).encode("utf-8")
@@ -98,7 +98,14 @@ def application_server():
 
         source_dir = workspace / "정관 및 규정"
         source_dir.mkdir()
-        create_synthetic_hwpx(source_dir / "E2E_징계규정_2026.05.27.hwpx")
+        create_synthetic_hwpx(
+            source_dir / "E2E_징계규정(개정 2025.1.1.).hwpx",
+            "2025년 구버전",
+        )
+        create_synthetic_hwpx(
+            source_dir / "E2E_징계규정(개정 2026.5.27.).hwpx",
+            "2026년 최신본",
+        )
 
         port = available_port()
         base_url = f"http://127.0.0.1:{port}"
@@ -241,6 +248,7 @@ def verify_search_and_download(page: Page) -> dict[str, object]:
     )
     result_count = page.locator("#result-count").inner_text().strip()
     assert re.fullmatch(r"\d+건", result_count), result_count
+    expect(page.locator("#version-timeline-section")).to_be_hidden()
 
     probe = page.context.request.post(
         f"{BASE_URL}/api/search",
@@ -255,6 +263,7 @@ def verify_search_and_download(page: Page) -> dict[str, object]:
     api_payload = probe.json()
     serialized = json.dumps(api_payload, ensure_ascii=False)
     assert "source_path" not in serialized
+    assert api_payload["timelines"] == []
     assert not re.search(r'"/(?!api/)[^\"]+"', serialized), "search API exposed an absolute path"
     page_markup = page.content()
     assert "/Users/" not in page_markup and "/srv/" not in page_markup
@@ -266,7 +275,61 @@ def verify_search_and_download(page: Page) -> dict[str, object]:
     response = page.context.request.get(urljoin(f"{BASE_URL}/", href))
     assert response.ok, f"download endpoint returned {response.status}"
 
-    return {"result_count": result_count, "download_checked": True}
+    page.locator("#latest-only").uncheck()
+    page.locator('#search-form button[type="submit"]').click()
+    expect(page.locator("#version-timeline-section")).to_be_visible()
+    timeline_versions = page.locator("#version-timelines [data-timeline-version]")
+    expect(timeline_versions).to_have_count(2)
+    source_names = page.locator("#version-timelines [data-timeline-version] .result-title strong")
+    expect(source_names.nth(0)).to_contain_text("2026.5.27")
+    expect(source_names.nth(1)).to_contain_text("2025.1.1")
+
+    page.locator("#timeline-sort").select_option("asc")
+    expect(source_names.nth(0)).to_contain_text("2025.1.1")
+    expect(source_names.nth(1)).to_contain_text("2026.5.27")
+
+    timeline_links = page.locator("#version-timelines a.download-button")
+    expect(timeline_links).to_have_count(4)
+    for index in range(timeline_links.count()):
+        timeline_href = timeline_links.nth(index).get_attribute("href")
+        assert timeline_href, f"timeline download {index} has no href"
+        timeline_response = page.context.request.get(urljoin(f"{BASE_URL}/", timeline_href))
+        assert timeline_response.ok, f"timeline download {index} returned {timeline_response.status}"
+        assert timeline_response.body(), f"timeline download {index} returned empty bytes"
+
+    history_probe = page.context.request.post(
+        f"{BASE_URL}/api/search",
+        data={
+            "query": "징계 규정의 최신 근거 조항",
+            "role": "admin",
+            "as_of": "2026-05-27",
+            "limit": 6,
+            "include_history": True,
+        },
+    )
+    assert history_probe.ok, f"history search API returned {history_probe.status}"
+    history_payload = history_probe.json()
+    assert len(history_payload["timelines"]) == 1
+    assert [
+        version["effective_from"] for version in history_payload["timelines"][0]["versions"]
+    ] == ["2026-05-27", "2025-01-01"]
+    history_serialized = json.dumps(history_payload, ensure_ascii=False)
+    assert "source_path" not in history_serialized
+    assert str(Path(tempfile.gettempdir())) not in history_serialized
+
+    page.locator("#latest-only").check()
+    expect(page.locator("#version-timeline-section")).to_be_hidden()
+    page.locator("#latest-only").uncheck()
+    page.locator('#search-form button[type="submit"]').click()
+    expect(page.locator("#version-timeline-section")).to_be_visible()
+    page.locator("#timeline-sort").select_option("desc")
+
+    return {
+        "result_count": result_count,
+        "download_checked": True,
+        "timeline_versions": 2,
+        "timeline_downloads": 4,
+    }
 
 
 def verify_viewport(browser, viewport: dict[str, int], screenshot: Path, label: str) -> dict[str, object]:
@@ -275,8 +338,12 @@ def verify_viewport(browser, viewport: dict[str, int], screenshot: Path, label: 
     attach_error_guards(page, errors)
     wait_for_application(page)
     page.locator("#actor-role").select_option("audit_lead")
-    page.locator('[data-view-target="operations"]').click()
-    expect(page.locator("#operations-view")).to_be_visible()
+    page.locator('[data-view-target="search"]').click()
+    page.locator("#query-input").fill("징계 규정의 최신 근거 조항")
+    page.locator("#latest-only").uncheck()
+    page.locator('#search-form button[type="submit"]').click()
+    expect(page.locator("#version-timeline-section")).to_be_visible()
+    expect(page.locator("#version-timelines [data-timeline-version]")).to_have_count(2)
     assert_layout(page, label)
     page.locator("#primary-nav").evaluate("element => { element.scrollLeft = 0; }")
     page.screenshot(path=str(screenshot), full_page=True)

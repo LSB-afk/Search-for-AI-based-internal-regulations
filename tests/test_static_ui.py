@@ -124,6 +124,27 @@ class ProductShellStaticTest(unittest.TestCase):
         self.assertRegex(HTML, r'id="latest-only"[^>]*checked')
         self.assertIn("include_history: !qs(\"#latest-only\").checked", JS)
 
+    def test_search_timeline_surface_sorting_and_download_controls_exist(self):
+        self.assertIn('id="version-timeline-section"', HTML)
+        self.assertIn('id="version-timelines"', HTML)
+        self.assertIn('id="timeline-sort"', HTML)
+        self.assertIn('value="desc"', HTML)
+        self.assertIn('value="asc"', HTML)
+        self.assertIn("최신순", HTML)
+        self.assertIn("과거순", HTML)
+        self.assertIn("function renderVersionTimelines(timelines, includeHistory)", JS)
+        self.assertIn("payload.timelines || []", JS)
+        self.assertIn("version.download?.source", JS)
+        self.assertIn("version.download?.source_pdf", JS)
+        self.assertNotIn("version.source_path", JS)
+
+    def test_search_clears_stale_timeline_for_latest_only_and_failures(self):
+        self.assertIn("function clearVersionTimelines()", JS)
+        self.assertRegex(JS, r"if\s*\(!includeHistory\)\s*\{\s*clearVersionTimelines\(\)")
+        run_search = re.search(r"async function runSearch\(\).*?\n\}", JS, re.DOTALL)
+        self.assertIsNotNone(run_search)
+        self.assertIn("clearVersionTimelines();", run_search.group(0))
+
     def test_approval_rejection_flow_is_audit_lead_only(self):
         self.assertIn("async function approveVersion(versionId, effectiveFrom)", JS)
         self.assertIn("async function rejectVersion(versionId)", JS)

@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import time
@@ -22,10 +23,13 @@ class IsolatedServerTest(unittest.TestCase):
         self.data_dir = Path(self.tmp.name) / "data"
         self.index_file = self.data_dir / "index.json"
         self.registry = RegulationRegistry(self.data_dir / "registry.json")
+        self.uploads_dir = Path(self.tmp.name) / "uploads"
+        self.uploads_dir.mkdir()
         self.patches = [
             mock.patch.object(server, "DATA_DIR", self.data_dir),
             mock.patch.object(server, "INDEX_FILE", self.index_file),
             mock.patch.object(server, "REGISTRY", self.registry),
+            mock.patch.object(server, "UPLOADS_DIR", self.uploads_dir),
             mock.patch.object(server, "configured_source_roots", lambda: [Path(self.tmp.name).resolve()]),
             mock.patch.object(server, "demo_mutations_enabled", lambda: True),
         ]
@@ -40,6 +44,32 @@ class IsolatedServerTest(unittest.TestCase):
     def write_chunks(self, chunks):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.index_file.write_text(json.dumps({"version": 1, "chunks": chunks}), encoding="utf-8")
+
+
+class AutoIngestConfigurationTest(unittest.TestCase):
+    def test_interval_defaults_to_sixty_seconds(self):
+        self.assertEqual(server.parse_auto_ingest_interval(None), 60)
+
+    def test_interval_rejects_invalid_and_too_small_values(self):
+        for value in ("bad", "0", "9"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    server.parse_auto_ingest_interval(value)
+
+
+class FakeAutoIngestService:
+    def __init__(self, snapshot, result=None, error=None):
+        self._snapshot = snapshot
+        self._result = result or {}
+        self._error = error
+
+    def snapshot(self):
+        return dict(self._snapshot)
+
+    def run_once(self, trigger):
+        if self._error:
+            raise self._error
+        return dict(self._result)
 
 
 class SearchVersionFilterTest(IsolatedServerTest):
@@ -156,6 +186,242 @@ class SearchVersionFilterTest(IsolatedServerTest):
 
         self.assertEqual([item["version_id"] for item in result["results"]], [old["version_id"]])
 
+    def test_search_history_returns_complete_newest_first_version_timeline_with_downloads(self):
+        old_source = Path(self.tmp.name) / "18. 인사규정(개정 2025.5.27.).hwp"
+        new_source = Path(self.tmp.name) / "18. 인사규정(개정 2026.4.13.).hwp"
+        old_source.write_bytes(b"old source")
+        new_source.write_bytes(b"new source")
+        chunks = [
+            server.make_chunk(
+                doc_title="18. 인사규정",
+                section_title="구버전",
+                text="징계 구 기준",
+                effective_from="2025-05-27",
+                source_file=old_source.name,
+                source_type="hwp",
+                source_path=str(old_source),
+            ),
+            server.make_chunk(
+                doc_title="18. 인사규정",
+                section_title="최신본",
+                text="징계 최신 기준",
+                effective_from="2026-04-13",
+                source_file=new_source.name,
+                source_type="hwp",
+                source_path=str(new_source),
+            ),
+        ]
+        old = self.registry.record_detection(
+            "18. 인사규정", str(old_source), "old-timeline-hash", "2025-05-27", [chunks[0]["id"]]
+        )
+        self.registry.approve_version(old["version_id"], "감사팀장", "2025-05-27", today="2026-07-12")
+        new = self.registry.record_detection(
+            "18. 인사규정", str(new_source), "new-timeline-hash", "2026-04-13", [chunks[1]["id"]]
+        )
+        self.registry.approve_version(new["version_id"], "감사팀장", "2026-04-13", today="2026-07-12")
+        chunks[0]["version_id"] = old["version_id"]
+        chunks[1]["version_id"] = new["version_id"]
+        self.write_chunks(chunks)
+
+        result = server.search_index("징계 기준", "employee", "2025-06-01", include_history=True)
+
+        self.assertEqual([item["version_id"] for item in result["results"]], [old["version_id"]])
+        self.assertEqual(len(result["timelines"]), 1)
+        timeline = result["timelines"][0]
+        self.assertEqual(timeline["regulation_id"], old["regulation_id"])
+        self.assertEqual(timeline["canonical_title"], "18. 인사규정")
+        self.assertEqual(
+            [version["version_id"] for version in timeline["versions"]],
+            [new["version_id"], old["version_id"]],
+        )
+        self.assertEqual(
+            [version["status"] for version in timeline["versions"]],
+            ["approved", "superseded"],
+        )
+        for version in timeline["versions"]:
+            self.assertRegex(version["download"]["source"], r"^/api/download/source\?id=")
+            self.assertRegex(version["download"]["source_pdf"], r"^/api/download/source-pdf\?id=")
+            self.assertNotIn("source_path", version)
+        self.assertNotIn(str(Path(self.tmp.name)), json.dumps(result, ensure_ascii=False))
+
+    def test_search_history_hydrates_stale_regulation_id_from_migrated_version(self):
+        legacy_state = {
+            "schema_version": 1,
+            "regulations": {
+                "old-reg": {
+                    "regulation_id": "old-reg",
+                    "canonical_title": "18. 인사규정(개정 2025.5.27.)",
+                    "category": None,
+                    "versions": ["old-version"],
+                },
+                "new-reg": {
+                    "regulation_id": "new-reg",
+                    "canonical_title": "18. 인사규정(개정 2026.4.13.)",
+                    "category": None,
+                    "versions": ["new-version"],
+                },
+            },
+            "versions": {
+                "new-version": {
+                    "version_id": "new-version",
+                    "regulation_id": "new-reg",
+                    "canonical_title": "18. 인사규정(개정 2026.4.13.)",
+                    "source_path": "/closed/new.hwp",
+                    "content_hash": "new",
+                    "effective_from": "2026-04-13",
+                    "effective_to": None,
+                    "chunk_ids": ["new-chunk"],
+                    "category": None,
+                    "change_type": "revision",
+                    "status": "approved",
+                },
+                "old-version": {
+                    "version_id": "old-version",
+                    "regulation_id": "old-reg",
+                    "canonical_title": "18. 인사규정(개정 2025.5.27.)",
+                    "source_path": "/closed/old.hwp",
+                    "content_hash": "old",
+                    "effective_from": "2025-05-27",
+                    "effective_to": None,
+                    "chunk_ids": ["old-chunk"],
+                    "category": None,
+                    "change_type": "revision",
+                    "status": "approved",
+                },
+            },
+            "scan_runs": [],
+            "events": [],
+        }
+        registry_path = self.data_dir / "legacy-registry.json"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(legacy_state, ensure_ascii=False), encoding="utf-8")
+        migrated_registry = RegulationRegistry(registry_path)
+        old_chunk = server.make_chunk(
+            doc_title="18. 인사규정(개정 2025.5.27.)",
+            section_title="구버전",
+            text="징계 구 기준",
+            effective_from="2025-05-27",
+            source_type="hwp",
+            source_path="/closed/old.hwp",
+        )
+        old_chunk.update(
+            {
+                "id": "old-chunk",
+                "version_id": "old-version",
+                "regulation_id": "old-reg",
+            }
+        )
+        self.write_chunks([old_chunk])
+
+        with mock.patch.object(server, "REGISTRY", migrated_registry):
+            result = server.search_index("징계 구 기준", "employee", "2026-07-12", include_history=True)
+
+        self.assertEqual(result["results"], [])
+        self.assertEqual(len(result["timelines"]), 1)
+        self.assertEqual(result["timelines"][0]["regulation_id"], "new-reg")
+        self.assertEqual(result["timelines"][0]["canonical_title"], "18. 인사규정")
+
+    def test_search_hydrates_current_registry_status_over_stale_chunk_metadata(self):
+        source = Path(self.tmp.name) / "감사규정_2026.05.27.hwp"
+        source.write_bytes(b"approved source")
+        scan = self.registry.scan_sources(
+            [source],
+            lambda path: [
+                server.make_chunk(
+                    doc_title="감사규정",
+                    section_title="본문",
+                    text="감사 자료 제출 기준",
+                    effective_from="2026-05-27",
+                    source_file=path.name,
+                    source_type="hwp",
+                    source_path=str(path),
+                )
+            ],
+        )
+        chunk = scan["chunks"][0]
+        self.assertEqual(chunk["version_status"], "pending")
+        self.registry.approve_version(chunk["version_id"], "감사팀장", "2026-05-27", today="2026-07-12")
+        self.write_chunks([chunk])
+
+        result = server.search_index("자료 제출", "audit", "2026-07-12")
+
+        self.assertEqual(result["results"][0]["version_status"], "approved")
+
+    def test_search_answer_uses_hydrated_registry_date_and_status(self):
+        version = self.registry.record_detection(
+            "감사규정", "/closed/audit.hwp", "answer-hash", "2026-05-27", ["audit-chunk"]
+        )
+        self.registry.approve_version(
+            version["version_id"], "감사팀장", "2026-05-27", today="2026-07-12"
+        )
+        chunk = server.make_chunk(
+            doc_title="감사규정",
+            section_title="자료 제출",
+            text="감사 자료 제출 기준",
+            effective_from="1999-01-01",
+            source_type="hwp",
+        )
+        chunk.update(
+            {
+                "id": "audit-chunk",
+                "version_id": version["version_id"],
+                "version_status": "pending",
+            }
+        )
+        self.write_chunks([chunk])
+
+        result = server.search_index("자료 제출", "audit", "2026-07-12")
+
+        self.assertEqual(result["results"][0]["effective_from"], "2026-05-27")
+        self.assertEqual(result["results"][0]["version_status"], "approved")
+        self.assertIn("2026-05-27", result["answer"])
+        self.assertIn("승인", result["answer"])
+        self.assertNotIn("1999-01-01", result["answer"])
+
+    def test_timeline_versions_expose_only_ui_required_fields(self):
+        version = self.registry.record_detection(
+            "인사규정", "/closed/personnel.hwp", "private-hash", "2026-05-27", ["personnel-chunk"]
+        )
+        self.registry.approve_version(
+            version["version_id"], "감사팀장", "2026-05-27", today="2026-07-12"
+        )
+        self.registry.state["versions"][version["version_id"]].update(
+            {"indexed": True, "indexed_at": "2026-07-12T00:00:00+00:00"}
+        )
+        chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="징계",
+            text="징계 기준",
+            source_file="personnel.hwp",
+            source_type="hwp",
+            source_path="/closed/personnel.hwp",
+        )
+        chunk.update({"id": "personnel-chunk", "version_id": version["version_id"]})
+
+        timelines = server.build_version_timelines(
+            {version["regulation_id"]}, [chunk], "employee"
+        )
+
+        self.assertEqual(
+            set(timelines[0]["versions"][0]),
+            {
+                "version_id",
+                "effective_from",
+                "effective_to",
+                "status",
+                "change_type",
+                "source_file",
+                "download",
+            },
+        )
+
+    def test_latest_only_search_returns_no_timeline_payload(self):
+        self.write_chunks([])
+
+        result = server.search_index("징계", "employee", "2026-07-12", include_history=False)
+
+        self.assertEqual(result["timelines"], [])
+
     def test_search_history_without_as_of_excludes_2027_scheduled_version_today(self):
         current = self.registry.record_detection("인사규정", "/closed/current.hwp", "current-hash", "2026-01-01", ["cur-c"])
         self.registry.approve_version(current["version_id"], "감사팀장", "2026-01-01", today="2026-07-12")
@@ -219,6 +485,62 @@ class SearchVersionFilterTest(IsolatedServerTest):
         result = server.search_index("징계 기준", "employee", "2024-01-01")
 
         self.assertEqual([item["doc_title"] for item in result["results"]], ["샘플규정"])
+
+    def test_add_chunks_upserts_stable_ids_without_retry_duplicates(self):
+        self.write_chunks([])
+        original = server.make_chunk(
+            doc_title="인사규정",
+            section_title="징계",
+            text="최초 색인 본문",
+        )
+        original["id"] = "stable-chunk"
+        retried = {**original, "text": "재시도로 갱신된 본문"}
+
+        first_count = server.add_chunks([original])
+        retry_count = server.add_chunks([retried])
+
+        indexed = server.load_index()["chunks"]
+        self.assertEqual(first_count, 1)
+        self.assertEqual(retry_count, 1)
+        self.assertEqual(len(indexed), 1)
+        self.assertEqual(indexed[0]["id"], "stable-chunk")
+        self.assertEqual(indexed[0]["text"], "재시도로 갱신된 본문")
+
+    def test_index_ack_failure_retry_replaces_random_ids_for_the_same_version(self):
+        source = Path(self.tmp.name) / "인사규정_2026.05.27.hwp"
+        source.write_bytes(b"same regulation")
+        self.write_chunks([])
+
+        def parse_with_new_chunk_id(path):
+            return [
+                server.make_chunk(
+                    doc_title="인사규정",
+                    section_title="징계",
+                    text="징계 기준",
+                    source_file=path.name,
+                    source_type="hwp",
+                    source_path=str(path),
+                )
+            ]
+
+        with mock.patch.object(server, "ingest_file", side_effect=parse_with_new_chunk_id), mock.patch.object(
+            self.registry, "mark_versions_indexed", side_effect=RuntimeError("ack write failed")
+        ):
+            with self.assertRaises(RuntimeError):
+                server.ingest_registered_sources([source])
+
+        first_chunks = server.load_index()["chunks"]
+        first_chunk_id = first_chunks[0]["id"]
+        version_id = first_chunks[0]["version_id"]
+
+        with mock.patch.object(server, "ingest_file", side_effect=parse_with_new_chunk_id):
+            server.ingest_registered_sources([source])
+
+        retried_chunks = server.load_index()["chunks"]
+        self.assertEqual(len(retried_chunks), 1)
+        self.assertNotEqual(retried_chunks[0]["id"], first_chunk_id)
+        self.assertEqual(retried_chunks[0]["version_id"], version_id)
+        self.assertTrue(self.registry.state["versions"][version_id]["indexed"])
 
 
 class ApiRoutesTest(IsolatedServerTest):
@@ -308,6 +630,42 @@ class ApiRoutesTest(IsolatedServerTest):
         self.assertEqual([item["version_id"] for item in versions["versions"]], [pending["version_id"]])
         self.assertEqual(events_status, 200)
         self.assertEqual(len(events["events"]), 1)
+
+    def test_dashboard_exposes_auto_ingest_status(self):
+        fake = FakeAutoIngestService(
+            {
+                "enabled": True,
+                "running": False,
+                "interval_seconds": 60,
+                "next_run_at": "2026-07-17T01:01:00+00:00",
+                "last_result": {
+                    "new_count": 1,
+                    "changed_count": 0,
+                    "error_count": 0,
+                },
+                "last_error": None,
+            }
+        )
+
+        with mock.patch.object(server, "AUTO_INGEST_SERVICE", fake):
+            status, payload = self.get_json("/api/dashboard")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["auto_ingest"]["enabled"], True)
+        self.assertEqual(payload["auto_ingest"]["interval_seconds"], 60)
+
+    def test_manual_ingest_returns_conflict_while_scan_is_running(self):
+        fake = FakeAutoIngestService(
+            {"enabled": True, "running": True, "interval_seconds": 60},
+            error=server.IngestAlreadyRunning("regulation ingest already running"),
+        )
+
+        with mock.patch.object(server, "AUTO_INGEST_SERVICE", fake):
+            status, payload = self.post_json("/api/ingest-local", {})
+
+        self.assertEqual(status, 409)
+        self.assertIn("already running", payload["error"])
+        self.assertEqual(payload["auto_ingest"]["running"], True)
 
     def test_public_read_apis_do_not_expose_internal_source_paths(self):
         private_path = "/srv/cheonan/regulations/인사규정.hwpx"
@@ -445,6 +803,100 @@ class ApiRoutesTest(IsolatedServerTest):
 
         self.assertEqual(status, 400)
         self.assertIn("as_of", body["error"])
+
+    def test_upload_enters_pending_approval_flow_and_is_not_searchable(self):
+        def fake_ingest(path):
+            return [
+                server.make_chunk(
+                    doc_title="인사규정",
+                    section_title="본문",
+                    text="업로드 징계 기준",
+                    effective_from="2026-05-27",
+                    source_file=path.name,
+                    source_type="hwp",
+                    source_path=str(path),
+                )
+            ]
+
+        with mock.patch.object(server, "ingest_file", side_effect=fake_ingest):
+            status, body = self.post_json(
+                "/api/upload",
+                {
+                    "filename": "인사규정_2026.05.27.hwp",
+                    "content_base64": base64.b64encode(b"uploaded regulation").decode("ascii"),
+                },
+            )
+
+        search = server.search_index("업로드 징계", "employee", "2026-07-12")
+        pending = list(self.registry.state["versions"].values())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["imported_chunks"], 1)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["status"], "pending")
+        self.assertEqual(pending[0]["canonical_title"], "인사규정")
+        self.assertNotIn(
+            pending[0]["version_id"],
+            {item.get("version_id") for item in search["results"]},
+        )
+        self.assertNotIn("업로드 징계 기준", json.dumps(search["results"], ensure_ascii=False))
+
+        approval_status, _ = self.post_json(
+            "/api/versions/approve",
+            {
+                "version_id": pending[0]["version_id"],
+                "effective_from": "2026-05-27",
+                "actor": "감사팀장",
+            },
+        )
+        approved_search = server.search_index("업로드 징계", "employee", "2026-07-12")
+
+        self.assertEqual(approval_status, 200)
+        approved_item = next(
+            item for item in approved_search["results"] if item.get("version_id") == pending[0]["version_id"]
+        )
+        self.assertEqual(approved_item["version_status"], "approved")
+        self.assertIn("업로드 징계 기준", approved_item["text"])
+
+    def test_chunkless_upload_still_returns_its_pending_version(self):
+        with mock.patch.object(server, "ingest_file", return_value=[]):
+            status, body = self.post_json(
+                "/api/upload",
+                {
+                    "filename": "빈규정_2026.05.27.hwp",
+                    "content_base64": base64.b64encode(b"empty regulation").decode("ascii"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["imported_chunks"], 0)
+        self.assertEqual(len(body["versions"]), 1)
+        self.assertEqual(body["versions"][0]["status"], "pending")
+        self.assertEqual(body["versions"][0]["canonical_title"], "빈규정")
+        self.assertNotIn("source_path", json.dumps(body, ensure_ascii=False))
+
+    def test_reset_clears_index_uploads_and_registry_history_together(self):
+        upload = self.uploads_dir / "temporary.hwp"
+        upload.write_bytes(b"temporary")
+        self.registry.record_detection(
+            "인사규정", str(upload), "reset-hash", "2026-05-27", ["chunk"]
+        )
+        self.write_chunks([])
+
+        status, body = self.post_json("/api/reset", {})
+        dashboard_status, dashboard = self.get_json("/api/dashboard")
+        versions_status, versions = self.get_json("/api/versions")
+        events_status, events = self.get_json("/api/events")
+
+        self.assertEqual(status, 200)
+        self.assertIn("documents", body)
+        self.assertFalse(upload.exists())
+        self.assertEqual(dashboard_status, 200)
+        self.assertEqual(dashboard["total_regulations"], 0)
+        self.assertEqual(dashboard["pending_count"], 0)
+        self.assertEqual(versions_status, 200)
+        self.assertEqual(versions["versions"], [])
+        self.assertEqual(events_status, 200)
+        self.assertEqual(events["events"], [])
 
     def test_successful_search_records_private_audit_event(self):
         chunks = [

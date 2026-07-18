@@ -44,8 +44,51 @@ def _parse_iso_date(value: str) -> datetime.date:
 def _normalize_title(value: str) -> str:
     title = unicodedata.normalize("NFC", value).strip()
     title = re.sub(r"\.(?:hwp|hwpx|pdf|docx?|xlsx?)$", "", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\s*\((?:제정|개정|전부개정)\s*20\d{2}[.\-년]\s*\d{1,2}[.\-월]\s*\d{1,2}(?:일)?\.?\)\s*$",
+        "",
+        title,
+    ).strip()
     title = re.sub(r"[\s_-]*(?:\d{4}[.-]\d{1,2}[.-]\d{1,2}|\d{8})$", "", title).strip()
     return title
+
+
+def _migrate_registry_state(value: dict[str, Any]) -> dict[str, Any]:
+    state = copy.deepcopy(value)
+    state.setdefault("schema_version", EMPTY_STATE["schema_version"])
+    state.setdefault("versions", {})
+    state.setdefault("scan_runs", [])
+    state.setdefault("events", [])
+    original_regulations = state.get("regulations", {})
+    regulations: dict[str, dict[str, Any]] = {}
+    regulation_id_by_title: dict[str, str] = {}
+
+    for version_id, version in state["versions"].items():
+        old_regulation_id = str(version.get("regulation_id") or "")
+        old_regulation = original_regulations.get(old_regulation_id, {})
+        title = _normalize_title(
+            str(version.get("canonical_title") or old_regulation.get("canonical_title") or "")
+        )
+        version["canonical_title"] = title
+        regulation_id = regulation_id_by_title.get(title)
+        if regulation_id is None:
+            regulation_id = old_regulation_id or uuid.uuid5(
+                uuid.NAMESPACE_URL, f"regulation:{title}"
+            ).hex
+            if regulation_id in regulations:
+                regulation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"regulation:{title}").hex
+            regulation_id_by_title[title] = regulation_id
+            regulations[regulation_id] = {
+                "regulation_id": regulation_id,
+                "canonical_title": title,
+                "category": version.get("category") or old_regulation.get("category"),
+                "versions": [],
+            }
+        version["regulation_id"] = regulation_id
+        regulations[regulation_id]["versions"].append(version_id)
+
+    state["regulations"] = regulations
+    return state
 
 
 def sha256_file(path: Path) -> str:
@@ -60,6 +103,17 @@ class RegulationRegistry:
     def __init__(self, path: Path):
         self.path = path
         self.state = self._load()
+        self._repair_loaded_effective_windows()
+
+    def _repair_loaded_effective_windows(self) -> None:
+        before = copy.deepcopy(self.state)
+        current_day = _parse_iso_date(business_today_iso())
+        transitions: list[tuple[dict[str, Any], str, str]] = []
+        for regulation_id in self.state["regulations"]:
+            transitions.extend(self._recompute_effective_windows(regulation_id, current_day))
+        self._record_status_transitions(transitions)
+        if self.state != before:
+            self._persist()
 
     def record_detection(
         self,
@@ -234,7 +288,7 @@ class RegulationRegistry:
         self._persist()
         return len(transitions)
 
-    def scan_sources(self, paths, ingest, effective_date=None) -> dict[str, Any]:
+    def scan_sources(self, paths, ingest, effective_date=None, canonical_title=None) -> dict[str, Any]:
         result: dict[str, Any] = {
             "new_count": 0,
             "changed_count": 0,
@@ -242,6 +296,7 @@ class RegulationRegistry:
             "error_count": 0,
             "chunks": [],
             "errors": [],
+            "version_ids": [],
         }
         scan_run = {
             "scan_run_id": uuid.uuid4().hex,
@@ -257,30 +312,37 @@ class RegulationRegistry:
             try:
                 source_path = Path(path)
                 resolved_source = str(source_path.resolve())
-                title = _normalize_title(source_path.name)
+                title_value = canonical_title(source_path) if canonical_title else source_path.name
+                title = _normalize_title(str(title_value))
                 content_hash = sha256_file(source_path)
-                previous = self._latest_version_for_title(title)
-                if previous is not None and previous["content_hash"] == content_hash:
-                    if self._version_needs_index_retry(previous):
+                duplicate = self._find_duplicate(title, content_hash)
+                if duplicate is not None:
+                    if self._version_needs_index_retry(duplicate):
                         chunks, chunk_ids = self._chunks_for_source(source_path, ingest)
-                        previous["chunk_ids"] = chunk_ids
+                        duplicate["chunk_ids"] = chunk_ids
                         for chunk in chunks:
-                            self._inject_version_metadata(chunk, previous)
+                            self._inject_version_metadata(chunk, duplicate)
                         result["chunks"].extend(chunks)
+                        result["version_ids"].append(duplicate["version_id"])
                         scan_run["sources"].append(
                             {
                                 "source_path": resolved_source,
                                 "status": "index_retry",
-                                "version_id": previous["version_id"],
+                                "version_id": duplicate["version_id"],
                             }
                         )
                         continue
                     result["unchanged_count"] += 1
                     scan_run["sources"].append(
-                        {"source_path": resolved_source, "status": "unchanged", "version_id": previous["version_id"]}
+                        {
+                            "source_path": resolved_source,
+                            "status": "unchanged",
+                            "version_id": duplicate["version_id"],
+                        }
                     )
                     continue
 
+                previous = self._latest_version_for_title(title)
                 change_type = "new" if previous is None else "changed"
                 ingest_result = ingest(source_path)
                 chunks, chunk_ids = self._index_chunks_for_ingest_result(ingest_result)
@@ -297,6 +359,7 @@ class RegulationRegistry:
                 for chunk in chunks:
                     self._inject_version_metadata(chunk, version)
                 result["chunks"].extend(chunks)
+                result["version_ids"].append(version["version_id"])
                 result[f"{change_type}_count"] += 1
                 scan_run["sources"].append(
                     {"source_path": resolved_source, "status": change_type, "version_id": version["version_id"]}
@@ -318,7 +381,15 @@ class RegulationRegistry:
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return copy.deepcopy(EMPTY_STATE)
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        migrated = _migrate_registry_state(loaded)
+        if migrated != loaded:
+            _write_json_atomic(self.path, migrated)
+        return migrated
+
+    def reset(self) -> None:
+        self.state = copy.deepcopy(EMPTY_STATE)
+        self._persist()
 
     def _persist(self) -> None:
         _write_json_atomic(self.path, self.state)
@@ -454,6 +525,9 @@ class RegulationRegistry:
         chunk["regulation_id"] = version["regulation_id"]
         chunk["version_id"] = version["version_id"]
         chunk["version_status"] = version["status"]
+        chunk["canonical_title"] = version["canonical_title"]
+        chunk["effective_from"] = version.get("effective_from")
+        chunk["effective_to"] = version.get("effective_to")
 
     def _version_needs_index_retry(self, version: dict[str, Any]) -> bool:
         return bool(version.get("index_required")) and not bool(version.get("indexed"))
@@ -500,7 +574,11 @@ class RegulationRegistry:
 
     def _find_duplicate(self, canonical_title: str, content_hash: str) -> dict[str, Any] | None:
         for version in self.state["versions"].values():
-            if version["canonical_title"] == canonical_title and version["content_hash"] == content_hash:
+            if (
+                version["status"] != "scan_error"
+                and version["canonical_title"] == canonical_title
+                and version["content_hash"] == content_hash
+            ):
                 return version
         return None
 

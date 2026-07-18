@@ -930,6 +930,63 @@ textarea {
   font-weight: 800;
 }
 
+.version-timeline-section {
+  min-width: 0;
+}
+
+.timeline-toolbar,
+.timeline-toolbar > div,
+.timeline-toolbar label,
+.version-timeline-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-toolbar {
+  justify-content: space-between;
+}
+
+.timeline-toolbar > div {
+  flex-wrap: wrap;
+}
+
+.timeline-toolbar label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.version-timeline-list {
+  display: grid;
+  gap: 14px;
+}
+
+.version-timeline-group {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.version-timeline-heading {
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.version-timeline-heading strong,
+.version-timeline-heading span,
+.source-unavailable {
+  overflow-wrap: anywhere;
+}
+
+.version-timeline-heading span,
+.source-unavailable {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .audit-events h3 {
   margin: 0 0 8px;
   font-size: 15px;
@@ -1015,7 +1072,9 @@ textarea {
   .app-header,
   .identity-switcher,
   .query-actions,
-  .view-heading {
+  .view-heading,
+  .timeline-toolbar,
+  .version-timeline-heading {
     align-items: stretch;
     flex-direction: column;
   }

@@ -1,5 +1,7 @@
+import json
 import tempfile
 import unittest
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -212,6 +214,181 @@ class RegulationRegistryTest(unittest.TestCase):
         self.assertEqual(chunk["regulation_id"], version["regulation_id"])
         self.assertEqual(chunk["version_id"], version["version_id"])
         self.assertEqual(chunk["version_status"], "pending")
+
+    def test_real_revision_filenames_share_one_canonical_regulation(self):
+        old_source = Path(self.tmp.name) / "18. 인사규정(개정 2025.5.27.).hwp"
+        new_source = Path(self.tmp.name) / unicodedata.normalize(
+            "NFD", "18. 인사규정(개정 2026.4.13.).hwp"
+        )
+        old_source.write_bytes(b"old revision")
+        new_source.write_bytes(b"new revision")
+
+        old_result = self.registry.scan_sources(
+            [old_source],
+            lambda path: [{"id": "old-chunk", "text": "구 인사규정"}],
+        )
+        new_result = self.registry.scan_sources(
+            [new_source],
+            lambda path: [{"id": "new-chunk", "text": "신 인사규정"}],
+        )
+
+        versions = list(self.registry.state["versions"].values())
+        self.assertEqual(old_result["new_count"], 1)
+        self.assertEqual(new_result["changed_count"], 1)
+        self.assertEqual(len(self.registry.state["regulations"]), 1)
+        self.assertEqual({version["canonical_title"] for version in versions}, {"18. 인사규정"})
+        self.assertEqual(len({version["regulation_id"] for version in versions}), 1)
+        self.assertEqual(
+            {version["effective_from"] for version in versions},
+            {"2025-05-27", "2026-04-13"},
+        )
+
+    def test_rescanning_multiple_revision_files_reuses_all_historical_versions(self):
+        old_source = Path(self.tmp.name) / "18. 인사규정(개정 2025.5.27.).hwp"
+        new_source = Path(self.tmp.name) / unicodedata.normalize(
+            "NFD", "18. 인사규정(개정 2026.4.13.).hwp"
+        )
+        old_source.write_bytes(b"old revision")
+        new_source.write_bytes(b"new revision")
+
+        first = self.registry.scan_sources(
+            [old_source, new_source],
+            lambda path: [{"id": f"{path.name}-chunk", "text": path.name}],
+        )
+        original_version_ids = set(self.registry.state["versions"])
+        self.registry.mark_versions_indexed(first["version_ids"])
+
+        second = self.registry.scan_sources(
+            [old_source, new_source],
+            lambda path: [{"id": f"{path.name}-chunk", "text": path.name}],
+        )
+
+        self.assertEqual(first["new_count"], 1)
+        self.assertEqual(first["changed_count"], 1)
+        self.assertEqual(second["unchanged_count"], 2)
+        self.assertEqual(second["changed_count"], 0)
+        self.assertEqual(set(self.registry.state["versions"]), original_version_ids)
+        self.assertEqual(len(self.registry.state["versions"]), 2)
+
+    def test_reset_clears_registry_state_and_persists_empty_state(self):
+        self.registry.record_detection(
+            "인사규정", "/closed/new.hwp", "hash", "2026-05-27", ["chunk"]
+        )
+
+        self.registry.reset()
+
+        self.assertEqual(self.registry.state["regulations"], {})
+        self.assertEqual(self.registry.state["versions"], {})
+        self.assertEqual(self.registry.state["scan_runs"], [])
+        self.assertEqual(self.registry.state["events"], [])
+        reloaded = RegulationRegistry(self.registry.path)
+        self.assertEqual(reloaded.state, self.registry.state)
+
+    def test_loading_legacy_fragmented_revision_titles_merges_regulations(self):
+        legacy_state = {
+            "schema_version": 1,
+            "regulations": {
+                "old-reg": {
+                    "regulation_id": "old-reg",
+                    "canonical_title": "18. 인사규정(개정 2025.5.27.)",
+                    "category": None,
+                    "versions": ["old-version"],
+                },
+                "new-reg": {
+                    "regulation_id": "new-reg",
+                    "canonical_title": "18. 인사규정(개정 2026.4.13.)",
+                    "category": None,
+                    "versions": ["new-version"],
+                },
+            },
+            "versions": {
+                "old-version": {
+                    "version_id": "old-version",
+                    "regulation_id": "old-reg",
+                    "canonical_title": "18. 인사규정(개정 2025.5.27.)",
+                    "source_path": "/closed/old.hwp",
+                    "content_hash": "old",
+                    "effective_from": "2025-05-27",
+                    "effective_to": None,
+                    "chunk_ids": ["old-chunk"],
+                    "category": None,
+                    "change_type": "new",
+                    "status": "approved",
+                },
+                "new-version": {
+                    "version_id": "new-version",
+                    "regulation_id": "new-reg",
+                    "canonical_title": "18. 인사규정(개정 2026.4.13.)",
+                    "source_path": "/closed/new.hwp",
+                    "content_hash": "new",
+                    "effective_from": "2026-04-13",
+                    "effective_to": None,
+                    "chunk_ids": ["new-chunk"],
+                    "category": None,
+                    "change_type": "new",
+                    "status": "approved",
+                },
+            },
+            "scan_runs": [],
+            "events": [],
+        }
+        self.registry.path.write_text(json.dumps(legacy_state, ensure_ascii=False), encoding="utf-8")
+
+        migrated = RegulationRegistry(self.registry.path)
+
+        self.assertEqual(len(migrated.state["regulations"]), 1)
+        self.assertEqual(
+            {version["canonical_title"] for version in migrated.state["versions"].values()},
+            {"18. 인사규정"},
+        )
+        self.assertEqual(
+            len({version["regulation_id"] for version in migrated.state["versions"].values()}),
+            1,
+        )
+        self.assertEqual(migrated.state["versions"]["old-version"]["status"], "superseded")
+        self.assertEqual(migrated.state["versions"]["old-version"]["effective_to"], "2026-04-12")
+        self.assertEqual(migrated.state["versions"]["new-version"]["status"], "approved")
+
+    def test_startup_window_repair_records_and_persists_status_transition_events(self):
+        old = self.registry.record_detection(
+            "인사규정", "/closed/old.hwp", "old", "2025-01-01", ["old-chunk"]
+        )
+        self.registry.approve_version(
+            old["version_id"], "감사팀장", "2025-01-01", today="2025-06-01"
+        )
+        scheduled = self.registry.record_detection(
+            "인사규정", "/closed/new.hwp", "new", "2026-04-13", ["new-chunk"]
+        )
+        self.registry.approve_version(
+            scheduled["version_id"], "감사팀장", "2026-04-13", today="2025-06-01"
+        )
+        original_event_count = len(self.registry.state["events"])
+
+        with mock.patch("regulation_registry.business_today_iso", return_value="2026-07-14"):
+            reloaded = RegulationRegistry(self.registry.path)
+
+        transition_events = reloaded.state["events"][original_event_count:]
+        self.assertEqual(
+            [event["event_type"] for event in transition_events],
+            ["RegulationVersionSuperseded", "ScheduledVersionActivated"],
+        )
+        self.assertEqual(reloaded.state["versions"][old["version_id"]]["status"], "superseded")
+        self.assertEqual(
+            reloaded.state["versions"][scheduled["version_id"]]["status"], "approved"
+        )
+        persisted = json.loads(self.registry.path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["events"], reloaded.state["events"])
+
+    def test_revision_normalization_preserves_meaningful_parentheses(self):
+        version = self.registry.record_detection(
+            "18. 임기제(직) 인사규정(전부개정 2026.4.13.).hwp",
+            "/closed/term.hwp",
+            "term-hash",
+            "2026-04-13",
+            ["term-chunk"],
+        )
+
+        self.assertEqual(version["canonical_title"], "18. 임기제(직) 인사규정")
 
     def test_scan_isolates_parser_failures(self):
         good = Path(self.tmp.name) / "복무규정_2026.05.27.hwp"

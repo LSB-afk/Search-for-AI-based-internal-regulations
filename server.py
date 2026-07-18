@@ -24,9 +24,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from auto_ingest import AutomaticIngestService, IngestAlreadyRunning
 from regulation_registry import RegulationRegistry, business_today_iso
 
 try:
@@ -53,6 +55,7 @@ PERMISSION_LEVEL = {"public": 0, "internal": 1, "audit": 2, "admin": 3}
 
 ROLE_LABEL = {"employee": "일반직원", "audit": "감사실", "admin": "관리자"}
 PERMISSION_LABEL = {"public": "공개", "internal": "내부", "audit": "감사", "admin": "관리자"}
+VERSION_STATUS_LABEL = {"approved": "승인", "scheduled": "시행 예정", "superseded": "이전 버전"}
 
 STOPWORDS = {
     "그리고",
@@ -81,6 +84,8 @@ STOPWORDS = {
 }
 
 REGISTRY = RegulationRegistry(REGISTRY_FILE)
+DATA_LOCK = RLock()
+AUTO_INGEST_SERVICE: AutomaticIngestService | None = None
 MUTATION_PATHS = {
     "/api/versions/approve",
     "/api/versions/reject",
@@ -100,6 +105,21 @@ def allowed_cors_origins() -> set[str]:
 
 def demo_mutations_enabled() -> bool:
     return os.environ.get("REG_RAG_ENABLE_DEMO_MUTATIONS") == "1"
+
+
+def parse_auto_ingest_interval(value: str | None) -> int:
+    raw_value = value or "60"
+    try:
+        interval = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "REG_RAG_AUTO_INGEST_INTERVAL_SECONDS must be an integer"
+        ) from exc
+    if interval < 10:
+        raise ValueError(
+            "REG_RAG_AUTO_INGEST_INTERVAL_SECONDS must be at least 10"
+        )
+    return interval
 
 
 def add_api_cors_headers(handler: BaseHTTPRequestHandler) -> None:
@@ -574,6 +594,7 @@ def search_chunks(
     limit: int,
     allowed_version_ids: set[str] | None = None,
     include_history: bool = False,
+    apply_effective_date_filter: bool = True,
 ) -> dict[str, Any]:
     explicit_or_detected_date = detect_date(query, as_of)
     query_terms = expand_terms(tokenize(query))
@@ -590,7 +611,8 @@ def search_chunks(
         if not can_access(role, chunk.get("permission", "internal")):
             blocked_count += 1
             continue
-        if not is_effective(chunk, explicit_or_detected_date):
+        registry_filtered = bool(version_id and allowed_version_ids is not None)
+        if apply_effective_date_filter and not registry_filtered and not is_effective(chunk, explicit_or_detected_date):
             date_filtered_count += 1
             continue
         score, matched = score_chunk(chunk, query_terms, idf)
@@ -637,7 +659,127 @@ def search_chunks(
     }
 
 
+def hydrate_chunk_version_metadata(chunk: dict[str, Any]) -> dict[str, Any]:
+    hydrated = dict(chunk)
+    version_id = chunk.get("version_id")
+    version = REGISTRY.state.get("versions", {}).get(version_id)
+    if not version:
+        return hydrated
+    hydrated.update(
+        {
+            "regulation_id": version["regulation_id"],
+            "canonical_title": version["canonical_title"],
+            "version_status": version["status"],
+            "effective_from": version.get("effective_from"),
+            "effective_to": version.get("effective_to"),
+        }
+    )
+    return hydrated
+
+
+def version_index_chunks(version: dict[str, Any], chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chunk_ids = {str(chunk_id) for chunk_id in version.get("chunk_ids", [])}
+    version_id = version.get("version_id")
+    return [
+        chunk
+        for chunk in chunks
+        if str(chunk.get("id")) in chunk_ids or chunk.get("version_id") == version_id
+    ]
+
+
+def version_download(chunks: list[dict[str, Any]]) -> dict[str, str] | None:
+    source_chunk = next(
+        (chunk for chunk in chunks if chunk.get("source_path")),
+        None,
+    )
+    if source_chunk is None:
+        return None
+    chunk_id_value = source_chunk.get("id")
+    return {
+        "source": f"/api/download/source?id={chunk_id_value}",
+        "source_pdf": f"/api/download/source-pdf?id={chunk_id_value}",
+    }
+
+
+def version_chunks_are_accessible(chunks: list[dict[str, Any]], role: str) -> bool:
+    if not chunks:
+        return True
+    required_level = max(
+        (PERMISSION_LEVEL.get(chunk.get("permission", "internal"), 1) for chunk in chunks),
+        default=1,
+    )
+    return ROLE_LEVEL.get(role, 1) >= required_level
+
+
+def build_version_timelines(
+    regulation_ids: set[str],
+    chunks: list[dict[str, Any]],
+    role: str,
+) -> list[dict[str, Any]]:
+    published_statuses = {"approved", "scheduled", "superseded"}
+    timelines: list[dict[str, Any]] = []
+    for regulation_id in regulation_ids:
+        regulation = REGISTRY.state.get("regulations", {}).get(regulation_id)
+        if not regulation:
+            continue
+        candidate_versions = [
+            REGISTRY.state["versions"][version_id]
+            for version_id in regulation.get("versions", [])
+            if version_id in REGISTRY.state.get("versions", {})
+        ]
+        versions_with_chunks = []
+        for version in candidate_versions:
+            if version.get("status") not in published_statuses or not version.get("effective_from"):
+                continue
+            indexed_chunks = version_index_chunks(version, chunks)
+            if version_chunks_are_accessible(indexed_chunks, role):
+                versions_with_chunks.append((version, indexed_chunks))
+        versions_with_chunks.sort(
+            key=lambda item: (item[0].get("effective_from") or "", item[0].get("version_id") or ""),
+            reverse=True,
+        )
+        if not versions_with_chunks:
+            continue
+        public_versions = []
+        for version, indexed_chunks in versions_with_chunks:
+            source_file = version.get("source_file")
+            if not source_file and version.get("source_path"):
+                source_file = Path(str(version["source_path"])).name
+            public_versions.append(
+                {
+                    "version_id": version.get("version_id"),
+                    "effective_from": version.get("effective_from"),
+                    "effective_to": version.get("effective_to"),
+                    "status": version.get("status"),
+                    "change_type": version.get("change_type"),
+                    "source_file": source_file,
+                    "download": version_download(indexed_chunks),
+                }
+            )
+        timelines.append(
+            {
+                "regulation_id": regulation_id,
+                "canonical_title": regulation.get("canonical_title")
+                or versions_with_chunks[0][0]["canonical_title"],
+                "versions": public_versions,
+            }
+        )
+    timelines.sort(key=lambda item: str(item["canonical_title"]))
+    return timelines
+
+
 def search_index(
+    query: str,
+    role: str,
+    as_of: str | None,
+    limit: int = 6,
+    include_history: bool = False,
+) -> dict[str, Any]:
+    with DATA_LOCK:
+        return search_index_snapshot(query, role, as_of, limit, include_history)
+
+
+def search_index_snapshot(
     query: str,
     role: str,
     as_of: str | None,
@@ -647,11 +789,11 @@ def search_index(
     payload = load_index()
     chunks = payload.get("chunks", [])
     effective_search_date = detect_date(query, as_of) or business_today_iso()
-    allowed_versions = REGISTRY.versions(effective_search_date, include_history=include_history)
+    allowed_versions = REGISTRY.versions(effective_search_date, include_history=False)
     allowed_version_ids = {
         version["version_id"] for version in allowed_versions if version_is_effective(version, effective_search_date)
     }
-    return search_chunks(
+    result = search_chunks(
         chunks,
         query,
         role,
@@ -660,6 +802,44 @@ def search_index(
         allowed_version_ids=allowed_version_ids,
         include_history=include_history,
     )
+    result["results"] = [hydrate_chunk_version_metadata(item) for item in result["results"]]
+    result["answer"] = generate_answer(
+        query,
+        result["results"],
+        role,
+        result["as_of"],
+        result["blocked_count"],
+        result["date_filtered_count"],
+    )
+    result["timelines"] = []
+    if not include_history:
+        return result
+
+    historical_versions = REGISTRY.versions(include_history=True)
+    historical_version_ids = {version["version_id"] for version in historical_versions}
+    historical_matches = search_chunks(
+        chunks,
+        query,
+        role,
+        effective_search_date,
+        max(len(chunks), 1),
+        allowed_version_ids=historical_version_ids,
+        include_history=True,
+        apply_effective_date_filter=False,
+    )
+    hydrated_historical_results = [
+        hydrate_chunk_version_metadata(item) for item in historical_matches["results"]
+    ]
+    regulation_ids = {
+        item["regulation_id"]
+        for item in hydrated_historical_results
+        if item.get("regulation_id")
+    }
+    regulation_ids.update(
+        item["regulation_id"] for item in result["results"] if item.get("regulation_id")
+    )
+    result["timelines"] = build_version_timelines(regulation_ids, chunks, role)
+    return result
 
 
 def search_audit_payload(query: str, role: str, as_of: str | None, result_count: int) -> dict[str, Any]:
@@ -703,10 +883,12 @@ def generate_answer(
         period = item.get("effective_from") or "시행일 미상"
         if item.get("effective_to"):
             period += f"~{item['effective_to']}"
+        version_status = VERSION_STATUS_LABEL.get(item.get("version_status"))
+        status = f", {version_status}" if version_status else ""
         summary = item.get("summary") or summarize_text(item.get("text", ""), item.get("matched_terms", []))
         evidence.append(
             f"{i}. {item['doc_title']} / {item['section_title']}{page} "
-            f"[{PERMISSION_LABEL.get(item.get('permission'), item.get('permission'))}, {period}]\n"
+            f"[{PERMISSION_LABEL.get(item.get('permission'), item.get('permission'))}, {period}{status}]\n"
             f"요약:\n{summary}\n"
             f"원문 일부: {item['snippet']}"
         )
@@ -937,9 +1119,32 @@ def ingest_zip(path: Path) -> list[dict[str, Any]]:
 
 def add_chunks(new_chunks: list[dict[str, Any]]) -> int:
     payload = load_index()
-    chunks = payload.get("chunks", [])
-    chunks.extend(new_chunks)
-    payload["chunks"] = chunks
+    incoming_version_ids = {
+        str(chunk["version_id"])
+        for chunk in new_chunks
+        if chunk.get("version_id") is not None
+    }
+    existing_chunks = [
+        chunk
+        for chunk in payload.get("chunks", [])
+        if chunk.get("version_id") is None
+        or str(chunk["version_id"]) not in incoming_version_ids
+    ]
+    merged: list[dict[str, Any]] = []
+    position_by_id: dict[str, int] = {}
+    for chunk in [*existing_chunks, *new_chunks]:
+        chunk_id_value = chunk.get("id")
+        if chunk_id_value is None:
+            merged.append(chunk)
+            continue
+        stable_id = str(chunk_id_value)
+        position = position_by_id.get(stable_id)
+        if position is None:
+            position_by_id[stable_id] = len(merged)
+            merged.append(chunk)
+        else:
+            merged[position] = chunk
+    payload["chunks"] = merged
     payload["updated_at"] = now_ms()
     write_json(INDEX_FILE, payload)
     return len(new_chunks)
@@ -1009,29 +1214,92 @@ def local_sources() -> list[Path]:
     return sorted(files, key=lambda p: str(p))
 
 
-def ingest_local_sources() -> dict[str, Any]:
+def ingest_registered_sources(paths, *, canonical_title=None) -> dict[str, Any]:
+    with DATA_LOCK:
+        return ingest_registered_sources_snapshot(
+            paths, canonical_title=canonical_title
+        )
+
+
+def ingest_registered_sources_snapshot(
+    paths, *, canonical_title=None
+) -> dict[str, Any]:
     result = REGISTRY.scan_sources(
-        local_sources(),
-        ingest=lambda path: ingest_file(path),
+        paths,
+        ingest=ingest_file,
         effective_date=lambda path: date_from_text(path.name),
+        canonical_title=canonical_title,
     )
     chunks = result.pop("chunks")
     result["imported_chunks"] = len(chunks)
+    indexed_version_ids = {chunk["version_id"] for chunk in chunks if chunk.get("version_id")}
+    version_ids = sorted(set(result.pop("version_ids", [])) | indexed_version_ids)
     if chunks:
         add_chunks(chunks)
-        REGISTRY.mark_versions_indexed(sorted({chunk["version_id"] for chunk in chunks if chunk.get("version_id")}))
+        REGISTRY.mark_versions_indexed(sorted(indexed_version_ids))
+    result["versions"] = [
+        public_version(REGISTRY.state["versions"][version_id])
+        for version_id in version_ids
+        if version_id in REGISTRY.state.get("versions", {})
+    ]
     result["documents"] = document_summary()
     return result
+
+
+def ingest_local_sources() -> dict[str, Any]:
+    return ingest_registered_sources(local_sources())
+
+
+def build_auto_ingest_service(
+    *, enabled: bool, interval_seconds: int
+) -> AutomaticIngestService:
+    return AutomaticIngestService(
+        ingest_local_sources,
+        enabled=enabled,
+        interval_seconds=interval_seconds,
+    )
+
+
+AUTO_INGEST_SERVICE = build_auto_ingest_service(
+    enabled=False, interval_seconds=60
+)
 
 
 def safe_upload_name(filename: str) -> str:
     stem = Path(filename).stem[:80] or "upload"
     suffix = Path(filename).suffix.lower()
     stem = re.sub(r"[^\w가-힣(). -]+", "_", stem, flags=re.UNICODE).strip()
-    return f"{int(time.time())}_{stem}{suffix}"
+    return f"{stem or 'upload'}{suffix}"
+
+
+def ingest_uploaded_file(filename: str, content: bytes) -> dict[str, Any]:
+    safe_name = safe_upload_name(filename)
+    upload_dir = UPLOADS_DIR / uuid.uuid4().hex
+    upload_dir.mkdir(parents=True, exist_ok=False)
+    target = upload_dir / safe_name
+    target.write_bytes(content)
+    return ingest_registered_sources(
+        [target],
+        canonical_title=lambda _: safe_name,
+    )
+
+
+def clear_uploads() -> None:
+    if not UPLOADS_DIR.exists():
+        return
+    for child in UPLOADS_DIR.iterdir():
+        if child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
 
 
 def get_chunk_by_id(chunk_id_value: str) -> dict[str, Any] | None:
+    with DATA_LOCK:
+        return get_chunk_by_id_snapshot(chunk_id_value)
+
+
+def get_chunk_by_id_snapshot(chunk_id_value: str) -> dict[str, Any] | None:
     for chunk in load_index().get("chunks", []):
         if chunk.get("id") == chunk_id_value:
             return chunk
@@ -1082,6 +1350,13 @@ def source_download_audit_payload(chunk: dict[str, Any], outcome: str) -> dict[s
 
 
 def record_source_download_event(chunk: dict[str, Any], event_type: str, outcome: str) -> None:
+    with DATA_LOCK:
+        record_source_download_event_snapshot(chunk, event_type, outcome)
+
+
+def record_source_download_event_snapshot(
+    chunk: dict[str, Any], event_type: str, outcome: str
+) -> None:
     payload = source_download_audit_payload(chunk, outcome)
     REGISTRY.record_event(
         event_type,
@@ -1095,6 +1370,11 @@ def record_source_download_event(chunk: dict[str, Any], event_type: str, outcome
 
 
 def record_missing_source_download_event(requested_id: str) -> None:
+    with DATA_LOCK:
+        record_missing_source_download_event_snapshot(requested_id)
+
+
+def record_missing_source_download_event_snapshot(requested_id: str) -> None:
     requested_id_bytes = requested_id.encode("utf-8", errors="replace")
     REGISTRY.record_event(
         "SourceDownloadFailed",
@@ -1151,6 +1431,11 @@ def source_download(handler: BaseHTTPRequestHandler, chunk: dict[str, Any]) -> N
 
 
 def source_chunks(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    with DATA_LOCK:
+        return source_chunks_snapshot(chunk)
+
+
+def source_chunks_snapshot(chunk: dict[str, Any]) -> list[dict[str, Any]]:
     source_path = chunk.get("source_path")
     if not source_path:
         return [chunk]
@@ -1515,6 +1800,11 @@ def public_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
 
 
 def dashboard_payload() -> dict[str, Any]:
+    with DATA_LOCK:
+        return dashboard_payload_snapshot()
+
+
+def dashboard_payload_snapshot() -> dict[str, Any]:
     versions = list(REGISTRY.state.get("versions", {}).values())
     current_count = len(REGISTRY.versions(None, include_history=False))
     pending_count = sum(1 for version in versions if version.get("status") in {"detected", "pending"})
@@ -1527,10 +1817,18 @@ def dashboard_payload() -> dict[str, Any]:
         "error_count": error_count,
         "last_scan": redact_source_paths(scan_runs[-1]) if scan_runs else None,
         "offline": True,
+        "auto_ingest": AUTO_INGEST_SERVICE.snapshot(),
     }
 
 
 def versions_payload(status: str | None = None, regulation_id: str | None = None) -> dict[str, Any]:
+    with DATA_LOCK:
+        return versions_payload_snapshot(status=status, regulation_id=regulation_id)
+
+
+def versions_payload_snapshot(
+    status: str | None = None, regulation_id: str | None = None
+) -> dict[str, Any]:
     versions = []
     for version in REGISTRY.state.get("versions", {}).values():
         if regulation_id and version.get("regulation_id") != regulation_id:
@@ -1741,15 +2039,16 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     result["as_of"],
                     len(result["results"]),
                 )
-                REGISTRY.record_event(
-                    "SearchExecuted",
-                    summary=payload["summary"],
-                    metadata=payload["metadata"],
-                    actor_role=result["role"],
-                    actor_name="search-user",
-                    target_type="regulation_search",
-                    target_id="search",
-                )
+                with DATA_LOCK:
+                    REGISTRY.record_event(
+                        "SearchExecuted",
+                        summary=payload["summary"],
+                        metadata=payload["metadata"],
+                        actor_role=result["role"],
+                        actor_name="search-user",
+                        target_type="regulation_search",
+                        target_id="search",
+                    )
                 json_response(self, HTTPStatus.OK, result)
                 return
             if path == "/api/versions/approve":
@@ -1765,7 +2064,10 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     effective_from = validate_api_date(effective_from, "effective_from")
-                    version = REGISTRY.approve_version(str(version_id), actor, effective_from)
+                    with DATA_LOCK:
+                        version = REGISTRY.approve_version(
+                            str(version_id), actor, effective_from
+                        )
                 except KeyError:
                     json_response(self, HTTPStatus.NOT_FOUND, operation_error("version_id not found"))
                     return
@@ -1786,7 +2088,10 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     json_response(self, HTTPStatus.BAD_REQUEST, operation_error("reason is required"))
                     return
                 try:
-                    version = REGISTRY.reject_version(str(version_id), actor, str(reason))
+                    with DATA_LOCK:
+                        version = REGISTRY.reject_version(
+                            str(version_id), actor, str(reason)
+                        )
                 except KeyError:
                     json_response(self, HTTPStatus.NOT_FOUND, operation_error("version_id not found"))
                     return
@@ -1802,23 +2107,31 @@ class RegRagHandler(BaseHTTPRequestHandler):
                 if not content_b64:
                     json_response(self, HTTPStatus.BAD_REQUEST, {"error": "content_base64 is required"})
                     return
-                target = UPLOADS_DIR / safe_upload_name(filename)
-                target.write_bytes(base64.b64decode(content_b64))
-                count = add_chunks(ingest_file(target))
-                json_response(self, HTTPStatus.OK, {"imported_chunks": count, "documents": document_summary()})
+                result = ingest_uploaded_file(filename, base64.b64decode(content_b64))
+                json_response(self, HTTPStatus.OK, redact_source_paths(result))
                 return
             if path == "/api/ingest-local":
-                json_response(self, HTTPStatus.OK, redact_source_paths(ingest_local_sources()))
+                try:
+                    result = AUTO_INGEST_SERVICE.run_once("manual")
+                except IngestAlreadyRunning as exc:
+                    json_response(
+                        self,
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": str(exc),
+                            "auto_ingest": AUTO_INGEST_SERVICE.snapshot(),
+                        },
+                    )
+                    return
+                json_response(self, HTTPStatus.OK, redact_source_paths(result))
                 return
             if path == "/api/reset":
-                seed_index(force=True)
-                if UPLOADS_DIR.exists():
-                    for child in UPLOADS_DIR.iterdir():
-                        if child.is_file():
-                            child.unlink()
-                        elif child.is_dir():
-                            shutil.rmtree(child)
-                json_response(self, HTTPStatus.OK, {"documents": document_summary()})
+                with DATA_LOCK:
+                    seed_index(force=True)
+                    clear_uploads()
+                    REGISTRY.reset()
+                    documents = document_summary()
+                json_response(self, HTTPStatus.OK, {"documents": documents})
                 return
             json_response(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
         except json.JSONDecodeError:

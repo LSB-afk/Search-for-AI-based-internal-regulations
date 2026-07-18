@@ -12,6 +12,8 @@ const state = {
   lastHealth: null,
   activeCategory: "all",
   documentFilter: "",
+  searchTimelines: [],
+  timelineSort: "desc",
 };
 
 const ROLE_VIEWS = {
@@ -846,6 +848,93 @@ function isRestrictedResult(item) {
   return item.restricted === true || item.blocked === true || item.allowed === false || item.access === "restricted";
 }
 
+function clearVersionTimelines() {
+  state.searchTimelines = [];
+  qs("#version-timeline-section").hidden = true;
+  qs("#timeline-result-count").textContent = "0개 버전";
+  qs("#version-timelines").innerHTML = "";
+}
+
+function sortedTimelineVersions(versions) {
+  const direction = state.timelineSort === "asc" ? 1 : -1;
+  return [...versions].sort((left, right) => {
+    const leftDate = left.effective_from || "";
+    const rightDate = right.effective_from || "";
+    if (!leftDate && rightDate) return 1;
+    if (leftDate && !rightDate) return -1;
+    const dateOrder = leftDate.localeCompare(rightDate);
+    if (dateOrder) return dateOrder * direction;
+    return String(left.version_id || "").localeCompare(String(right.version_id || "")) * direction;
+  });
+}
+
+function renderVersionTimelines(timelines, includeHistory) {
+  if (!includeHistory) {
+    clearVersionTimelines();
+    return;
+  }
+  state.searchTimelines = Array.isArray(timelines) ? timelines : [];
+  if (!state.searchTimelines.length) {
+    clearVersionTimelines();
+    return;
+  }
+
+  const section = qs("#version-timeline-section");
+  const root = qs("#version-timelines");
+  const versionCount = state.searchTimelines.reduce(
+    (count, timeline) => count + (timeline.versions || []).length,
+    0,
+  );
+  qs("#timeline-result-count").textContent = `${versionCount}개 버전`;
+  section.hidden = false;
+  root.innerHTML = state.searchTimelines
+    .map((timeline) => {
+      const versions = sortedTimelineVersions(timeline.versions || []);
+      return `
+        <article class="version-timeline-group">
+          <div class="version-timeline-heading">
+            <strong>${escapeHtml(timeline.canonical_title || "규정명 미상")}</strong>
+            <span>${versions.length}개 개정본</span>
+          </div>
+          <div class="timeline">
+            ${versions
+              .map((version) => {
+                const period = [version.effective_from || "시행일 미상", version.effective_to || ""]
+                  .filter(Boolean)
+                  .join(" ~ ");
+                const sourceHref = version.download?.source ? apiUrl(version.download.source) : "";
+                const sourcePdfHref = version.download?.source_pdf ? apiUrl(version.download.source_pdf) : "";
+                return `
+                  <article class="timeline-item ${escapeHtml(version.status || "")}" data-timeline-version="${escapeHtml(version.version_id || "")}">
+                    <div class="timeline-stem"></div>
+                    <div class="timeline-content">
+                      <div class="result-title">
+                        <div>
+                          <strong>${escapeHtml(version.source_file || timeline.canonical_title || "원본 미상")}</strong>
+                          <span>${escapeHtml(period)}</span>
+                        </div>
+                        <span class="status-pill ${escapeHtml(version.status || "")}">${escapeHtml(versionStatusLabel(version))}</span>
+                      </div>
+                      <div class="meta-row">
+                        <span class="badge">${escapeHtml(version.change_type || "변경 유형 미상")}</span>
+                      </div>
+                      <div class="download-row">
+                        ${sourceHref ? `<a class="download-button" href="${sourceHref}">원본 다운로드</a>` : ""}
+                        ${sourcePdfHref ? `<a class="download-button" href="${sourcePdfHref}">PDF 다운로드</a>` : ""}
+                        ${!sourceHref && !sourcePdfHref ? `<span class="source-unavailable">원본 없음</span>` : ""}
+                      </div>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("")}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
 function renderResults(payload) {
   qs("#answer-output").textContent = payload.answer || "";
   qs("#result-count").textContent = `${(payload.results || []).length}건`;
@@ -855,6 +944,7 @@ function renderResults(payload) {
   filterParts.push(`권한 제외 ${payload.blocked_count}`);
   filterParts.push(`시점 제외 ${payload.date_filtered_count}`);
   qs("#filter-summary").textContent = filterParts.join(" · ");
+  renderVersionTimelines(payload.timelines || [], payload.include_history === true);
 
   const root = qs("#results");
   if (!payload.results || !payload.results.length) {
@@ -935,6 +1025,7 @@ async function runSearch() {
     qs("#result-count").textContent = "0건";
     qs("#filter-summary").textContent = "";
     qs("#results").innerHTML = "";
+    clearVersionTimelines();
     throw new Error(message);
   }
 }
@@ -989,6 +1080,7 @@ async function resetIndex() {
   qs("#results").innerHTML = "";
   qs("#result-count").textContent = "0건";
   qs("#filter-summary").textContent = "";
+  clearVersionTimelines();
 }
 
 function setQueryAndSearch(query) {
@@ -1041,6 +1133,12 @@ function bindEvents() {
 
   qs("#latest-only").addEventListener("change", () => {
     qs("#filter-summary").textContent = qs("#latest-only").checked ? "최신본만" : "개정 이력 포함";
+    if (qs("#latest-only").checked) clearVersionTimelines();
+  });
+
+  qs("#timeline-sort").addEventListener("change", (event) => {
+    state.timelineSort = event.target.value === "asc" ? "asc" : "desc";
+    renderVersionTimelines(state.searchTimelines, true);
   });
 
   qsa("#documents, #category-queries, #category-documents").forEach((root) => {
