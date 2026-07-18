@@ -1,10 +1,13 @@
 import json
+import sys
 import tempfile
 import unittest
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from regulation_registry import RegulationRegistry, business_today_iso, date_from_path
 

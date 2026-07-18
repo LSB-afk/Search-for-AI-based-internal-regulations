@@ -4,6 +4,7 @@ __pycache__/
 
 # Local runtime data
 data/*.json
+data-backup-*/
 uploads/
 tmp/
 

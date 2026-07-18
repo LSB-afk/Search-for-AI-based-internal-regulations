@@ -1,6 +1,10 @@
+import sys
 import time
 import unittest
+from pathlib import Path
 from threading import Event, Thread
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from auto_ingest import AutomaticIngestService, IngestAlreadyRunning
 

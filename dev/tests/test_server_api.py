@@ -1,5 +1,6 @@
 import base64
 import json
+import sys
 import tempfile
 import time
 import unittest
@@ -12,6 +13,8 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from regulation_registry import RegulationRegistry

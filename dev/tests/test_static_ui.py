@@ -4,7 +4,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 JS = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")

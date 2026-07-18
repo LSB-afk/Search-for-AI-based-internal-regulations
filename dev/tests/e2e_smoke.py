@@ -26,6 +26,7 @@ from playwright.sync_api import Page, expect, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BASE_URL = os.environ.get("REG_RAG_BASE_URL", "").rstrip("/")
 DESKTOP_SCREENSHOT = Path("/tmp/cheonan-regulation-desktop.png")
 MOBILE_SCREENSHOT = Path("/tmp/cheonan-regulation-mobile.png")
@@ -92,9 +93,12 @@ def application_server():
         workspace = Path(temporary)
         app_dir = workspace / "app"
         app_dir.mkdir()
-        shutil.copy2(ROOT / "server.py", app_dir / "server.py")
-        shutil.copy2(ROOT / "regulation_registry.py", app_dir / "regulation_registry.py")
-        shutil.copytree(ROOT / "static", app_dir / "static")
+        dev_dir = app_dir / "dev"
+        dev_dir.mkdir()
+        shutil.copy2(ROOT / "server.py", dev_dir / "server.py")
+        shutil.copy2(ROOT / "auto_ingest.py", dev_dir / "auto_ingest.py")
+        shutil.copy2(ROOT / "regulation_registry.py", dev_dir / "regulation_registry.py")
+        shutil.copytree(REPO_ROOT / "static", app_dir / "static")
 
         source_dir = workspace / "정관 및 규정"
         source_dir.mkdir()
@@ -118,7 +122,7 @@ def application_server():
             }
         )
         process = subprocess.Popen(
-            [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port)],
+            [sys.executable, "dev/server.py", "--host", "127.0.0.1", "--port", str(port)],
             cwd=app_dir,
             env=environment,
             stdout=subprocess.PIPE,

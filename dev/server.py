@@ -38,12 +38,13 @@ except Exception:  # pragma: no cover - handled at runtime
 
 
 ROOT = Path(__file__).resolve().parent
-STATIC_DIR = ROOT / "static"
-DATA_DIR = ROOT / "data"
-UPLOADS_DIR = ROOT / "uploads"
+APP_ROOT = ROOT.parent
+STATIC_DIR = APP_ROOT / "static"
+DATA_DIR = APP_ROOT / "data"
+UPLOADS_DIR = APP_ROOT / "uploads"
 INDEX_FILE = DATA_DIR / "index.json"
 REGISTRY_FILE = DATA_DIR / "regulation_registry.json"
-WORKSPACE_DIR = ROOT.parent
+WORKSPACE_DIR = APP_ROOT.parent
 HWP5TXT = Path(os.environ.get("HWP5TXT_BIN") or shutil.which("hwp5txt") or "/opt/anaconda3/bin/hwp5txt")
 BUNDLED_PYTHON = Path(
     os.environ.get("REG_RAG_PDF_PYTHON")
@@ -141,7 +142,7 @@ def configured_source_roots() -> list[Path]:
         raw_path = raw_path.strip()
         if raw_path:
             roots.append(Path(raw_path).expanduser())
-    roots.extend([WORKSPACE_DIR, ROOT])
+    roots.extend([WORKSPACE_DIR, APP_ROOT])
 
     resolved_roots: list[Path] = []
     seen: set[Path] = set()
@@ -1193,7 +1194,7 @@ def local_sources() -> list[Path]:
         if path.is_dir()
         and "정관" in unicodedata.normalize("NFC", path.name)
         and "규정" in unicodedata.normalize("NFC", path.name)
-        and path.name != ROOT.name
+        and path.name != APP_ROOT.name
     ]
     if regulation_dirs:
         files: list[Path] = []

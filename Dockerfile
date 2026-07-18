@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8765
-CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8765"]
+CMD ["python", "dev/server.py", "--host", "0.0.0.0", "--port", "8765"]

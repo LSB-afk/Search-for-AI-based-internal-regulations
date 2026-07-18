@@ -2,6 +2,19 @@
 
 지방공기업 내부망 규정 검색 아이디어를 빠르게 검증하기 위한 로컬 웹앱입니다.
 
+## 폴더 구조
+
+```
+dev/                      # 개발 폴더 (모든 파이썬 개발 코드)
+  server.py               # 검색 서버 본체 (API + 화면 제공)
+  auto_ingest.py          # 규정 폴더 자동 스캔 스케줄러
+  regulation_registry.py  # 규정 버전 레지스트리 (감지→검토 대기→승인)
+  tests/                  # 단위·통합·E2E 테스트
+static/                   # 웹 화면 (HTML/CSS/JS, GitHub Pages 배포 대상)
+data/                     # 로컬 색인·레지스트리 JSON (커밋하지 않음)
+docs/                     # 설계 문서와 구현 계획
+```
+
 ## 보안 원칙
 
 이 저장소에는 내부 규정 원문과 로컬 색인 파일을 커밋하지 않습니다.
@@ -14,7 +27,7 @@
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 server.py
+python3 dev/server.py
 ```
 
 브라우저에서 `http://127.0.0.1:8765`를 엽니다.
@@ -22,16 +35,16 @@ python3 server.py
 승인, 반려, 업로드, 재색인, 초기화 API는 기본적으로 비활성화됩니다. 화면 시연 중 해당 변경 동작까지 사용할 때만 다음처럼 명시적으로 활성화합니다. 이 플래그는 실제 사용자 인증을 대신하지 않습니다.
 
 ```bash
-REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 server.py
+REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 dev/server.py
 ```
 
 전체 단위 테스트와 브라우저 E2E는 다음처럼 실행합니다. E2E에는 Python Playwright와 Chromium이 설치되어 있어야 합니다.
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile regulation_registry.py server.py
+python3 -m unittest discover -s dev/tests -v
+python3 -m py_compile dev/auto_ingest.py dev/regulation_registry.py dev/server.py
 node --check static/app.js
-python3 tests/e2e_smoke.py
+python3 dev/tests/e2e_smoke.py
 ```
 
 E2E는 임시 앱 복사본과 합성 HWPX 규정을 만들고, 사용 가능한 로컬 포트에서 서버를 직접 시작한 뒤 종료합니다. 기존 서버를 점검할 때만 `REG_RAG_BASE_URL=http://127.0.0.1:8765`를 지정합니다.
@@ -47,7 +60,7 @@ python3 -m pip install --no-index --find-links ./wheelhouse -r requirements.txt
 REG_RAG_SOURCE_DIRS="/srv/cheonan/regulations" \
 REG_RAG_AUTO_INGEST=1 \
 REG_RAG_AUTO_INGEST_INTERVAL_SECONDS=60 \
-python3 server.py --host 0.0.0.0 --port 8765
+python3 dev/server.py --host 0.0.0.0 --port 8765
 ```
 
 권장 볼륨 구성은 다음과 같습니다.
@@ -75,13 +88,13 @@ docker run --rm -p 8765:8765 \
 HWP 본문 파싱은 `hwp5txt`를 사용합니다. 자동 탐색이 안 되면 환경변수로 경로를 지정합니다.
 
 ```bash
-HWP5TXT_BIN=/opt/anaconda3/bin/hwp5txt python3 server.py
+HWP5TXT_BIN=/opt/anaconda3/bin/hwp5txt python3 dev/server.py
 ```
 
 원본 PDF 다운로드에는 `reportlab`을 사용합니다. 기본 Python에 `reportlab`이 없고 별도 Python을 쓰려면 다음처럼 지정할 수 있습니다.
 
 ```bash
-REG_RAG_PDF_PYTHON=/path/to/python3 python3 server.py
+REG_RAG_PDF_PYTHON=/path/to/python3 python3 dev/server.py
 ```
 
 ## 로컬 규정 색인
@@ -89,7 +102,7 @@ REG_RAG_PDF_PYTHON=/path/to/python3 python3 server.py
 서버 실행 후 화면의 로컬 색인 기능이나 API를 사용하면 현재 워크스페이스의 규정 파일을 색인합니다. API로 실행하려면 서버를 시연 변경 플래그와 함께 시작한 뒤 요청합니다.
 
 ```bash
-REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 server.py
+REG_RAG_ENABLE_DEMO_MUTATIONS=1 python3 dev/server.py
 ```
 
 ```bash
@@ -99,7 +112,7 @@ curl -X POST http://127.0.0.1:8765/api/ingest-local
 서버 시작과 동시에 색인하려면 다음처럼 실행합니다.
 
 ```bash
-python3 server.py --ingest-local
+python3 dev/server.py --ingest-local
 ```
 
 규정 폴더가 앱 폴더 밖에 있으면 `REG_RAG_SOURCE_DIRS`에 지정합니다.
@@ -107,7 +120,7 @@ python3 server.py --ingest-local
 ```bash
 REG_RAG_SOURCE_DIRS="/path/to/regulations" \
 REG_RAG_AUTO_INGEST=1 \
-python3 server.py --host 0.0.0.0 --port 8765
+python3 dev/server.py --host 0.0.0.0 --port 8765
 ```
 
 ## GitHub Pages 시연판
@@ -127,7 +140,7 @@ GitHub Pages 시연판에서 로컬 API 호출을 허용하려면 서버 실행 
 ```bash
 REG_RAG_ALLOWED_ORIGINS="https://lsb-afk.github.io" \
 REG_RAG_ENABLE_DEMO_MUTATIONS=1 \
-python3 server.py
+python3 dev/server.py
 ```
 
 별도 HTTPS 백엔드 API를 연결할 때는 다음처럼 엽니다.
