@@ -958,6 +958,14 @@ function renderVersionTimelines(timelines, includeHistory) {
     .join("");
 }
 
+function searchEngineLabel(engine) {
+  if (!engine || engine.mode !== "hybrid") return "기본";
+  const parts = [engine.tokenizer === "kiwi" ? "kiwi" : "regex", "bm25"];
+  if (engine.dense?.status === "ready") parts.push("dense");
+  if (engine.reranker?.status === "ready") parts.push("rerank");
+  return parts.join("+");
+}
+
 function renderResults(payload) {
   qs("#answer-output").textContent = payload.answer || "";
   qs("#result-count").textContent = `${(payload.results || []).length}건`;
@@ -966,6 +974,7 @@ function renderResults(payload) {
   filterParts.push(payload.role_label || state.role);
   filterParts.push(`권한 제외 ${payload.blocked_count}`);
   filterParts.push(`시점 제외 ${payload.date_filtered_count}`);
+  filterParts.push(`엔진 ${searchEngineLabel(payload.engine)}`);
   qs("#filter-summary").textContent = filterParts.join(" · ");
   renderVersionTimelines(payload.timelines || [], payload.include_history === true);
 

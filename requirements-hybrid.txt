@@ -1,0 +1,5 @@
+# 하이브리드 검색 선택 의존성.
+# 설치하지 않아도 서버는 정규식 토크나이저 + BM25로 동작한다.
+kiwipiepy>=0.18
+fastembed>=0.4
+# 대안 백엔드(torch 포함, 용량 큼): sentence-transformers>=3.0

@@ -97,6 +97,46 @@ HWP5TXT_BIN=/opt/anaconda3/bin/hwp5txt python3 dev/server.py
 REG_RAG_PDF_PYTHON=/path/to/python3 python3 dev/server.py
 ```
 
+## 하이브리드 검색
+
+검색은 형태소 분석(Kiwi) + BM25 + (선택) 임베딩 + (선택) 리랭커를 RRF(Reciprocal Rank Fusion)로 결합한 하이브리드 엔진이 기본입니다. 각 구성 요소는 없으면 자동으로 빠지며 검색은 항상 동작합니다.
+
+- 형태소 분석: `kiwipiepy`가 설치되어 있으면 Kiwi, 없으면 기존 정규식 토크나이저로 폴백합니다.
+- BM25: 순수 파이썬 구현이라 의존성 없이 항상 사용합니다.
+- 임베딩·리랭커: 폐쇄망 원칙에 따라 기본 비활성입니다. 모델 파일이 로컬 캐시에 준비된 환경에서만 명시적으로 켭니다.
+
+```bash
+python3 -m pip install -r requirements-hybrid.txt
+```
+
+```bash
+REG_RAG_DENSE=1 \
+REG_RAG_EMBED_MODEL="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" \
+REG_RAG_RERANK_MODEL="jinaai/jina-reranker-v2-base-multilingual" \
+python3 dev/server.py
+```
+
+- `REG_RAG_SEARCH_ENGINE=legacy`: 기존 TF-IDF 휴리스틱으로 되돌립니다(A/B 비교용).
+- `REG_RAG_TOKENIZER=regex|kiwi|auto`: 토크나이저를 강제합니다.
+- `REG_RAG_DENSE=1`: 임베딩 검색을 켭니다. 백엔드는 `fastembed`(ONNX) 우선, `sentence-transformers` 폴백입니다.
+- `REG_RAG_RERANK_MODEL`: 지정 시 상위 후보를 크로스인코더로 재정렬합니다.
+- 폐쇄망 배포 시 모델은 사전에 로컬 캐시로 반입해야 하며, 운영 중 외부 다운로드가 발생하지 않아야 합니다.
+- 임베딩·리랭커 로드 실패는 검색을 중단시키지 않습니다. `/api/health`의 `search` 필드에 오류 종류만 기록되고 BM25로 동작합니다.
+
+## 검색 품질 평가(매칭율 실증)
+
+`dev/eval/gold_queries.jsonl`의 골드셋(질의→정답 조항)으로 파이프라인 조합별 순위 품질을 측정합니다.
+
+```bash
+python3 dev/search_eval.py            # 가능한 모든 조합 비교
+python3 dev/search_eval.py --no-dense # 어휘 파이프라인만
+```
+
+- 지표: Hit@1, Recall@3/5, MRR@10, nDCG@5
+- 조합: 기존 TF-IDF → BM25+정규식 → BM25+Kiwi → +임베딩 → +리랭커 (ablation)
+- 유의성: 질의 단위 paired bootstrap(1만 회, 고정 시드)으로 nDCG@5 차이의 95% CI를 산출합니다.
+- 골드셋은 코퍼스가 바뀌면 함께 갱신해야 하며, 실제 규정 색인으로 평가하려면 내부망에서 골드셋을 확장해 사용합니다.
+
 ## 로컬 규정 색인
 
 서버 실행 후 화면의 로컬 색인 기능이나 API를 사용하면 현재 워크스페이스의 규정 파일을 색인합니다. API로 실행하려면 서버를 시연 변경 플래그와 함께 시작한 뒤 요청합니다.

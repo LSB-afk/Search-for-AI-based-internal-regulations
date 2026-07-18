@@ -28,6 +28,7 @@ from threading import RLock
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+import hybrid_search
 from auto_ingest import AutomaticIngestService, IngestAlreadyRunning
 from regulation_registry import RegulationRegistry, business_today_iso
 
@@ -106,6 +107,15 @@ def allowed_cors_origins() -> set[str]:
 
 def demo_mutations_enabled() -> bool:
     return os.environ.get("REG_RAG_ENABLE_DEMO_MUTATIONS") == "1"
+
+
+def search_engine_mode() -> str:
+    mode = os.environ.get("REG_RAG_SEARCH_ENGINE", "hybrid").strip().lower()
+    return mode if mode in {"hybrid", "legacy"} else "hybrid"
+
+
+def get_search_engine() -> "hybrid_search.HybridSearcher":
+    return hybrid_search.get_engine(frozenset(STOPWORDS))
 
 
 def parse_auto_ingest_interval(value: str | None) -> int:
@@ -587,6 +597,10 @@ def summarize_text(text: str, terms: list[str], max_sentences: int = 3) -> str:
     return "\n".join(bullets)
 
 
+def chunk_search_text(chunk: dict[str, Any]) -> str:
+    return f"{chunk.get('doc_title','')} {chunk.get('section_title','')} {chunk.get('text','')}"
+
+
 def search_chunks(
     chunks: list[dict[str, Any]],
     query: str,
@@ -598,13 +612,11 @@ def search_chunks(
     apply_effective_date_filter: bool = True,
 ) -> dict[str, Any]:
     explicit_or_detected_date = detect_date(query, as_of)
-    raw_query_terms = set(tokenize(query))
-    query_terms = expand_terms(tokenize(query))
-    idf = build_idf(chunks)
+    engine_mode = search_engine_mode()
     real_source_available = any(chunk.get("source_type") != "sample" for chunk in chunks)
     blocked_count = 0
     date_filtered_count = 0
-    scored: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for chunk in chunks:
         version_id = chunk.get("version_id")
         if version_id and allowed_version_ids is not None and version_id not in allowed_version_ids:
@@ -617,9 +629,38 @@ def search_chunks(
         if apply_effective_date_filter and not registry_filtered and not is_effective(chunk, explicit_or_detected_date):
             date_filtered_count += 1
             continue
-        score, matched = score_chunk(chunk, query_terms, idf)
-        if score <= 0 and query_terms:
-            continue
+        candidates.append(chunk)
+
+    engine_info: dict[str, Any] = {"mode": engine_mode}
+    ranked_candidates: list[tuple[dict[str, Any], float, list[str], dict[str, Any] | None]] = []
+    if engine_mode == "hybrid":
+        engine = get_search_engine()
+        raw_query_terms = set(engine.tokenizer.tokenize(query))
+        query_terms = expand_terms(sorted(raw_query_terms))
+        ranked = engine.rank(
+            query,
+            [chunk_search_text(chunk) for chunk in candidates],
+            query_tokens=query_terms,
+        )
+        engine_info.update(engine.pipeline())
+        ranked_candidates = [
+            (candidates[item["index"]], item["score"], item["matched_terms"], item["scores"])
+            for item in ranked
+        ]
+        if not query_terms and not ranked_candidates:
+            ranked_candidates = [(chunk, 0.0, [], None) for chunk in candidates]
+    else:
+        raw_query_terms = set(tokenize(query))
+        query_terms = expand_terms(tokenize(query))
+        idf = build_idf(chunks)
+        for chunk in candidates:
+            score, matched = score_chunk(chunk, query_terms, idf)
+            if score <= 0 and query_terms:
+                continue
+            ranked_candidates.append((chunk, score, matched, None))
+
+    scored: list[dict[str, Any]] = []
+    for chunk, score, matched, score_detail in ranked_candidates:
         if real_source_available:
             if chunk.get("source_type") == "sample":
                 score *= 0.35
@@ -633,16 +674,17 @@ def search_chunks(
                 "source": f"/api/download/source?id={chunk.get('id')}",
                 "source_pdf": f"/api/download/source-pdf?id={chunk.get('id')}",
             }
-        scored.append(
-            {
-                **{k: v for k, v in chunk.items() if k not in {"tokens", "source_path"}},
-                "score": round(score, 4),
-                "matched_terms": matched,
-                "snippet": make_snippet(chunk.get("text", ""), matched or query_terms),
-                "summary": summarize_text(chunk.get("text", ""), matched or query_terms),
-                "download": download,
-            }
-        )
+        entry = {
+            **{k: v for k, v in chunk.items() if k not in {"tokens", "source_path"}},
+            "score": round(score, 4),
+            "matched_terms": matched,
+            "snippet": make_snippet(chunk.get("text", ""), matched or query_terms),
+            "summary": summarize_text(chunk.get("text", ""), matched or query_terms),
+            "download": download,
+        }
+        if score_detail is not None:
+            entry["scores"] = score_detail
+        scored.append(entry)
 
     scored.sort(key=lambda item: item["score"], reverse=True)
     results = scored[:limit]
@@ -652,6 +694,7 @@ def search_chunks(
         "role_label": ROLE_LABEL.get(role, role),
         "as_of": explicit_or_detected_date,
         "query_terms": query_terms,
+        "engine": engine_info,
         "results": results,
         "answer": generate_answer(query, results, role, explicit_or_detected_date, blocked_count, date_filtered_count),
         "blocked_count": blocked_count,
@@ -1940,6 +1983,10 @@ class RegRagHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "chunks": len(load_index().get("chunks", [])),
                     "pdfplumber": pdfplumber is not None,
+                    "search": {
+                        "mode": search_engine_mode(),
+                        **(get_search_engine().pipeline() if search_engine_mode() == "hybrid" else {}),
+                    },
                 },
             )
             return
