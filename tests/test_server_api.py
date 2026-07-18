@@ -542,6 +542,62 @@ class SearchVersionFilterTest(IsolatedServerTest):
         self.assertEqual(retried_chunks[0]["version_id"], version_id)
         self.assertTrue(self.registry.state["versions"][version_id]["indexed"])
 
+    def test_synonym_expansion_does_not_trigger_sensitive_gate_for_regular_queries(self):
+        audit_chunk = server.make_chunk(
+            doc_title="1. 감사규정(제정 2023.7.31.)",
+            section_title="제1조(목적)",
+            text="이 규정은 감사규정 운영에 필요한 사항을 정한다.",
+            source_type="hwp",
+            effective_from="2023-07-31",
+        )
+        security_chunk = server.make_chunk(
+            doc_title="10. 보안업무규정(제정 2023.7.31.)",
+            section_title="제28조(대외비문서의 관리)",
+            text="대외비 문서는 비밀에 준하여 보관 및 관리한다.",
+            source_type="hwp",
+            effective_from="2023-07-31",
+        )
+
+        result = server.search_chunks(
+            [audit_chunk, security_chunk],
+            "1. 감사규정(제정 2023.7.31.)",
+            "admin",
+            "2023-07-31",
+            6,
+        )
+
+        titles = [item["doc_title"] for item in result["results"]]
+        self.assertIn("1. 감사규정(제정 2023.7.31.)", titles)
+        self.assertEqual(result["results"][0]["doc_title"], "1. 감사규정(제정 2023.7.31.)")
+
+    def test_explicit_sensitive_query_still_requires_sensitive_match(self):
+        unrelated_chunk = server.make_chunk(
+            doc_title="14. 여비규정(개정 2023.11.21.)",
+            section_title="제3조(지급 기준)",
+            text="여비는 실비 지급을 원칙으로 한다.",
+            source_type="hwp",
+            effective_from="2023-11-21",
+        )
+        security_chunk = server.make_chunk(
+            doc_title="10. 보안업무규정(제정 2023.7.31.)",
+            section_title="제28조(대외비문서의 관리)",
+            text="대외비 문서는 비밀에 준하여 보관 및 관리한다.",
+            source_type="hwp",
+            effective_from="2023-07-31",
+        )
+
+        result = server.search_chunks(
+            [unrelated_chunk, security_chunk],
+            "대외비 문서 보관 기준",
+            "admin",
+            "2024-01-01",
+            6,
+        )
+
+        titles = [item["doc_title"] for item in result["results"]]
+        self.assertIn("10. 보안업무규정(제정 2023.7.31.)", titles)
+        self.assertNotIn("14. 여비규정(개정 2023.11.21.)", titles)
+
     def test_automatic_scan_keeps_pending_replacement_out_of_latest_search(self):
         current = self.registry.record_detection(
             "인사규정",

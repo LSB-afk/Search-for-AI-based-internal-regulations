@@ -597,6 +597,7 @@ def search_chunks(
     apply_effective_date_filter: bool = True,
 ) -> dict[str, Any]:
     explicit_or_detected_date = detect_date(query, as_of)
+    raw_query_terms = set(tokenize(query))
     query_terms = expand_terms(tokenize(query))
     idf = build_idf(chunks)
     real_source_available = any(chunk.get("source_type") != "sample" for chunk in chunks)
@@ -623,7 +624,7 @@ def search_chunks(
                 score *= 0.35
             else:
                 score += 1.5
-        if SENSITIVE_QUERY_TERMS.intersection(query_terms) and not SENSITIVE_MATCH_TERMS.intersection(matched):
+        if SENSITIVE_QUERY_TERMS.intersection(raw_query_terms) and not SENSITIVE_MATCH_TERMS.intersection(matched):
             continue
         download = None
         if chunk.get("source_path"):
