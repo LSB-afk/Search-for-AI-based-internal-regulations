@@ -4,7 +4,7 @@
     {
       "name": "reg-rag-server",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["server.py"],
+      "runtimeArgs": ["dev/server.py"],
       "port": 8765
     }
   ]
