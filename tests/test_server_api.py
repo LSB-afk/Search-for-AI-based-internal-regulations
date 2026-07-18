@@ -542,6 +542,67 @@ class SearchVersionFilterTest(IsolatedServerTest):
         self.assertEqual(retried_chunks[0]["version_id"], version_id)
         self.assertTrue(self.registry.state["versions"][version_id]["indexed"])
 
+    def test_automatic_scan_keeps_pending_replacement_out_of_latest_search(self):
+        current = self.registry.record_detection(
+            "인사규정",
+            "/closed/인사규정_2025.hwp",
+            "old-hash",
+            "2025-01-01",
+            ["old-chunk"],
+        )
+        self.registry.approve_version(current["version_id"], "감사팀장", "2025-01-01")
+        current_chunk = server.make_chunk(
+            doc_title="인사규정",
+            section_title="징계",
+            text="기존 징계 기준",
+            source_file="인사규정_2025.hwp",
+            source_type="hwp",
+            effective_from="2025-01-01",
+        )
+        current_chunk.update(
+            version_id=current["version_id"],
+            regulation_id=current["regulation_id"],
+            version_status="approved",
+        )
+        self.write_chunks([current_chunk])
+
+        replacement_path = Path(self.tmp.name) / "인사규정_2026.07.17.hwp"
+        replacement_path.write_bytes(b"changed-regulation")
+        replacement_chunks = [
+            server.make_chunk(
+                doc_title="인사규정",
+                section_title="징계",
+                text="새 징계 기준",
+                source_file=replacement_path.name,
+                source_type="hwp",
+                source_path=str(replacement_path),
+            )
+        ]
+
+        service = server.build_auto_ingest_service(enabled=False, interval_seconds=60)
+        with mock.patch.object(server, "AUTO_INGEST_SERVICE", service), mock.patch.object(
+            server, "local_sources", return_value=[replacement_path]
+        ), mock.patch.object(server, "ingest_file", return_value=replacement_chunks):
+            service.run_once("automatic")
+
+        before_approval = server.search_index("징계 기준", "employee", "2026-07-17")
+        self.assertEqual(
+            [item["text"] for item in before_approval["results"]], ["기존 징계 기준"]
+        )
+
+        pending = next(
+            version
+            for version in self.registry.state["versions"].values()
+            if version["status"] == "pending"
+        )
+        self.registry.approve_version(pending["version_id"], "감사팀장", "2026-07-17")
+        after_approval = server.search_index("징계 기준", "employee", "2026-07-17")
+        self.assertEqual(after_approval["results"][0]["text"], "새 징계 기준")
+        self.assertEqual(
+            after_approval["results"][0]["download"]["source"],
+            f"/api/download/source?id={replacement_chunks[0]['id']}",
+        )
+
 
 class ApiRoutesTest(IsolatedServerTest):
     def setUp(self):
