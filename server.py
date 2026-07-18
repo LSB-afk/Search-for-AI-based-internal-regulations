@@ -2143,6 +2143,8 @@ class RegRagHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global AUTO_INGEST_SERVICE
+
     parser = argparse.ArgumentParser(description="Internal regulation RAG prototype")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
@@ -2150,9 +2152,20 @@ def main() -> None:
     parser.add_argument("--ingest-local", action="store_true", help="index local regulation source folders before serving")
     args = parser.parse_args()
 
+    auto_enabled = os.environ.get("REG_RAG_AUTO_INGEST") == "1"
+    interval_seconds = (
+        parse_auto_ingest_interval(os.environ.get("REG_RAG_AUTO_INGEST_INTERVAL_SECONDS"))
+        if auto_enabled
+        else 60
+    )
+    AUTO_INGEST_SERVICE = build_auto_ingest_service(
+        enabled=auto_enabled,
+        interval_seconds=interval_seconds,
+    )
+
     seed_index(force=args.reset)
-    if args.ingest_local or os.environ.get("REG_RAG_AUTO_INGEST") == "1":
-        result = ingest_local_sources()
+    if args.ingest_local or auto_enabled:
+        result = AUTO_INGEST_SERVICE.run_once("startup")
         print(
             "Local ingest: "
             f"{result['imported_chunks']} chunks, "
@@ -2160,13 +2173,17 @@ def main() -> None:
             f"{len(result['errors'])} errors"
         )
     server = ThreadingHTTPServer((args.host, args.port), RegRagHandler)
+    AUTO_INGEST_SERVICE.start()
     print(f"RegRAG prototype running at http://{args.host}:{args.port}")
     print(f"Workspace: {WORKSPACE_DIR}")
+    if auto_enabled:
+        print(f"Automatic regulation refresh every {interval_seconds}s")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        AUTO_INGEST_SERVICE.stop()
         server.server_close()
 
 
